@@ -1,126 +1,211 @@
-# GenAI Dataset Chatbot
+🧠 GenAI Data Agent
 
-A full-stack web application that allows users to **upload CSV/XLSX datasets** and **interactively ask questions about the data** using a conversational Generative AI chatbot.
+An AI-powered full-stack web application that allows users to upload datasets or connect to a Microsoft SQL Server database and interactively analyze data using a conversational AI agent.
 
-Unlike traditional demos with hardcoded data, this application dynamically adapts to **user-uploaded datasets** and performs AI-driven analysis in real time.
+Unlike static demos with hardcoded data, this system dynamically adapts to uploaded files and live database tables, generates SQL queries automatically, executes them safely, and optionally visualizes the results.
 
----
+🚀 Key Features
+-📁 Data Sources
 
-## 🚀 Key Features
+ -Upload CSV / XLSX files
+ -Connect to Microsoft SQL Server
+ -Dynamically load database tables
+ -Schema-aware query generation
 
-- 📁 Upload CSV or Excel (XLSX) files
-- 💬 Ask natural language questions about the uploaded dataset
-- 🧠 AI-powered data analysis using Gemini
-- 🔄 Dynamic, schema-agnostic dataset handling
-- 🖥️ React-based chat interface
-- ⚙️ FastAPI backend
-- 🛡️ Graceful handling of AI rate limits and errors
+-💬 Conversational AI Interface
 
----
+ -Ask questions in natural language
+ -AI automatically generates valid SQL Server queries
+ -Dynamic schema enforcement (no hardcoded columns)
+ -Context-aware responses
 
-## 🏗️ Tech Stack
+ -Multi-chat support (like ChatGPT-style sessions)
 
-### Frontend
-- React (Vite)
-- JavaScript
-- CSS
+-📊 Smart Visualization Engine
 
-### Backend
-- FastAPI (Python)
-- Pandas
-- Gemini Generative AI API
+ -Automatic chart detection
+ -Supports:
+  -Bar charts
+  -Line charts
+  -Pie charts
+ -Intent-aware chart generation
+ -No charts for summaries unless explicitly requested
 
----
+-🧠 AI SQL Agent (Local LLM Powered)
 
-## 📂 Project Structure
+ -Uses Llama3 via Ollama
+ -Generates SQL using Microsoft SQL Server syntax
+ -Converts invalid clauses (LIMIT → TOP)
+ -Enforces correct schema usage
+ -Blocks unsafe queries (INSERT, DELETE, DROP, etc.)
+ -Fully local inference (no external API dependency)
 
+-🛡️ Safety & Stability
+
+ -SELECT-only execution
+ -Schema enforcement
+ -SQL sanitization
+ -Intent-based visualization control
+ -Graceful error handling
+
+-🏗️ Tech Stack
+
+ -Frontend
+
+ -React (Vite)
+ -Chart.js
+ -react-chartjs-2
+ -JavaScript
+ -CSS
+
+-Backend
+
+ -FastAPI
+ -Pandas
+ -SQLAlchemy
+ -PyODBC
+ -Ollama (Llama3/qwen2.5b)
+ -Microsoft SQL Server
+
+-📂 Project Structure
 genai-sql-app/
-├── main.py # FastAPI backend
-├── frontend/ # React frontend
-│ ├── src/
-│ |── package.json
-| |--
+├── main.py                # FastAPI backend
 ├── requirements.txt
-├── .env # API keys (not committed)
+├── .env                   # Environment variables
+│
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── components/
+│   │   │   ├── Sidebar.jsx
+│   │   │   └── ...
+│   │   └── index.css
+│   ├── package.json
+│
 └── README.md
 
-yaml
-Copy code
+⚙️ Setup Instructions
 
----
-
-## ⚙️ Setup Instructions
-
-### 1️⃣ Clone the Repository
-```bash
+1️⃣ Clone the Repository
 git clone <repository-url>
 cd genai-sql-app
-2️⃣ Backend Setup
+
+2️⃣ Install & Setup Ollama (Required)
+
+Install Ollama from:
+https://ollama.com
+
+Pull Llama3:
+ollama pull llama3
+
+Run Ollama server:
+ollama run llama3
+
+Or simply keep Ollama running in background.
+
+3️⃣ Backend Setup
+
 Install dependencies:
+pip install -r requirements.txt
 
-bash
-Copy code
-pip install fastapi uvicorn pandas openpyxl python-dotenv google-generativeai
-Create a .env file:
+Make sure you have:
 
-env
-Copy code
-GOOGLE_API_KEY=your_gemini_api_key
-Run the backend:
+SQL Server running
+ODBC Driver 17 installed
 
-bash
-Copy code
-uvicorn main:app
-Backend will be available at:
+Update database config in main.py:
+DB_SERVER = "YOUR_SERVER_NAME"
+DB_NAME = "YOUR_DATABASE_NAME"
 
-arduino
-Copy code
+Run backend:
+
+uvicorn main:app --reload
+
+Backend runs at:
+
 http://localhost:8000
-3️⃣ Frontend Setup
-bash
-Copy code
+
+Swagger Docs:
+
+http://localhost:8000/docs
+4️⃣ Frontend Setup
 cd frontend
 npm install
 npm run dev
-Frontend will be available at:
 
-arduino
-Copy code
+Frontend runs at:
+
 http://localhost:5173
-🧠 How the System Works
-User uploads a CSV/XLSX file via the frontend
 
-Backend reads the file into an in-memory Pandas DataFrame
+-🧠 How the System Works
 
-The chat endpoint uses the uploaded dataset as context
+ -CSV/XLSX Mode
+ -User uploads dataset
+ -Backend loads into Pandas DataFrame
+ -AI agent generates logic over in-memory data
+ -Returns explanation + optional chart
 
-Gemini analyzes a sample of the dataset
+-SQL Server Mode
 
-AI-generated insights are returned conversationally
+ -User selects a DB table
+ -Backend fetches schema dynamically
+ -AI generates SQL Server query
+ -Query is sanitized and validated
+ -SQL executes
+ -Results returned conversationally
+ -Chart generated if intent requires
 
-If no dataset is uploaded, the system can fall back to default data.
+-📊 Chart Intelligence
 
-⚠️ Notes & Limitations
-Uploaded datasets are stored in memory
+ Charts are generated only when:
+ -User asks for chart / plot / visualize
+ -User asks for ranking (top / highest / lowest)
 
-Restarting the backend clears uploaded data
+ Chart types auto-detected based on:
+ -Numeric vs categorical columns
+ -Aggregated results
+ -User preference (bar / line / pie)
 
-Gemini free-tier rate limits apply
+-🔥 Advanced Capabilities
 
-Designed primarily for demo and single-user usage
+ -Dynamic schema enforcement
+ -LIMIT → TOP conversion
+ -TOP clause correction
+ -SQL aggregation correction
+ -Multi-chat memory system
+ -Per-chat loading state
+ -Intent detection engine
+ -Automatic chart preference detection
 
-Architecture can be extended for persistence and multi-user support
+-⚠️ Notes & Limitations
 
-🔮 Future Enhancements
-Persistent dataset storage
+ -Uploaded datasets are stored in memory
+ -Restarting backend clears session data
+ -Designed for single-user environment
+ -LLM inference speed depends on local hardware
+ -Large result sets may be summarized automatically
 
-Data visualizations and charts
+-🔮 Future Enhancements
 
-Column-level explanations
+ -Persistent chat storage
+ -Authentication system
+ -Multi-user support
+ -Role-based database access
+ -Advanced chart customization
+ -Export to CSV / Excel
+ -Download charts as PNG
+ -Vector database memory
+ -RAG-based contextual history
 
-Conversation memory
+-🎯 Purpose
 
-Authentication and multi-user support
+ This project demonstrates how a local LLM can be combined with:
+ -Live databases
+ -User-uploaded datasets
+ -Dynamic SQL generation
+ -Intelligent visualization
+ -Conversational UI
+ to create a production-style AI Data Analyst system.
 
-🎯 Purpose
-This project demonstrates how Generative AI can be combined with real-world datasets to create an intuitive, conversational data analysis experience using modern full-stack technologies.
+ This is not just a chatbot.
+ It is a dynamic AI-powered data exploration engine.
