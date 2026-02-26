@@ -1,18 +1,42 @@
 import React from "react";
 
-function Sidebar() {
+function Sidebar({
+  chats,
+  activeChatId,
+  setActiveChatId,
+  createNewChat,
+  collapsed
+}) {
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar ${collapsed ? "collapsed" : ""}`}>
+      
       <div className="logo">⚡ GenAI</div>
 
-      <button className="new-chat-btn">
+      {/* New Chat Button */}
+      <button
+        className="new-chat-btn"
+        onClick={createNewChat}
+      >
         + New Chat
       </button>
 
-      <div className="menu">
-        <div className="menu-item">💬 Chats</div>
-        <div className="menu-item">🛠 Tools</div>
+      {/* Chat List */}
+      <div className="chat-list">
+        {chats.map(chat => (
+          <div
+            key={chat.id}
+            onClick={() => setActiveChatId(chat.id)}
+            className={
+              chat.id === activeChatId
+                ? "chat-item active"
+                : "chat-item"
+            }
+          >
+            {chat.title}
+          </div>
+        ))}
       </div>
+
     </aside>
   );
 }

@@ -30,11 +30,19 @@ ChartJS.register(
 function App() {
   const [tableName, setTableName] = useState("");
   const [tables, setTables] = useState([]);
-  const [messages, setMessages] = useState([]);
+  const [chats, setChats] = useState([
+  {
+    id: Date.now(),
+    title: "New Chat",
+    messages: [],
+    loading:false
+  }
+  ]);
+  const [activeChatId, setActiveChatId] = useState(Date.now());
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState("");
   const [collapsed, setCollapsed] = useState(false);
+  const activeChat = chats.find(chat => chat.id === activeChatId);
 
   useEffect(() => {
     fetch("http://localhost:8000/tables")
@@ -44,6 +52,19 @@ function App() {
       })
       .catch(() => console.error("Failed to load tables"));
   }, []);
+
+
+  function createNewChat() {
+  const newChat = {
+    id: Date.now(),
+    title: "New Chat",
+    messages: [],
+    loading:false
+  };
+
+  setChats(prev => [newChat, ...prev]);
+  setActiveChatId(newChat.id);
+}
 
   async function handleFileUpload(e) {
     const file = e.target.files[0];
@@ -98,41 +119,90 @@ function App() {
   }
 
   async function sendMessage() {
-    if (!input.trim()) return;
+  if (!input.trim()) return;
 
-    const currentInput = input;
+  const currentInput = input;
 
-    setMessages(prev => [...prev, { sender: "user", text: currentInput }]);
-    setInput("");
-    setLoading(true);
+  // Add user message
+  setChats(prevChats =>
+    prevChats.map(chat =>
+      chat.id === activeChatId
+        ? {
+            ...chat,
+            messages: [
+              ...chat.messages,
+              { sender: "user", text: currentInput }
+            ],
+            title:
+              chat.messages.length === 0
+                ? currentInput.slice(0, 25)
+                : chat.title
+          }
+        : chat
+    )
+  );
 
-    try {
-      const res = await fetch("http://localhost:8000/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: currentInput }),
-      });
+  setInput("");
 
-      const data = await res.json();
+  setChats(prevChats =>
+    prevChats.map(chat =>
+      chat.id === activeChatId
+        ? { ...chat, loading: true }
+        : chat
+    )
+  );
 
-      setMessages(prev => [
-        ...prev,
-        {
-          sender: "bot",
-          text: data.reply ||  "",
-          chart: data.chart || null
-        }
-      ]);
+  try {
+    const res = await fetch("http://localhost:8000/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: currentInput }),
+    });
 
-    } catch {
-      setMessages(prev => [
-        ...prev,
-        { sender: "bot", text: "Backend error" }
-      ]);
-    } finally {
-      setLoading(false);
-    }
+    const data = await res.json();
+
+    setChats(prevChats =>
+      prevChats.map(chat =>
+        chat.id === activeChatId
+          ? {
+              ...chat,
+              messages: [
+                ...chat.messages,
+                {
+                  sender: "bot",
+                  text: data.reply || "",
+                  chart: data.chart || null
+                }
+              ]
+            }
+          : chat
+      )
+    );
+
+  } catch {
+    setChats(prevChats =>
+      prevChats.map(chat =>
+        chat.id === activeChatId
+          ? {
+              ...chat,
+              messages: [
+                ...chat.messages,
+                { sender: "bot", text: "Backend error" }
+              ]
+            }
+          : chat
+      )
+    );
+  } finally {
+    setChats(prevChats =>
+      prevChats.map(chat =>
+        chat.id === activeChatId
+          ? { ...chat, loading: false }
+          : chat
+      )
+    );
   }
+}
 
   return (
     <div className="app">
@@ -141,6 +211,10 @@ function App() {
       <Sidebar
         collapsed={collapsed}
         setCollapsed={setCollapsed}
+        chats={chats}
+        activeChatId={activeChatId}
+        setActiveChatId={setActiveChatId}
+        createNewChat={createNewChat}
       />
 
       {/* Main Chat Area */}
@@ -155,13 +229,13 @@ function App() {
         {/* Chat Window */}
         <div className="chat-window">
 
-          {messages.length === 0 && (
+          {activeChat?.messages.length === 0 && (
             <div className="empty">
               Upload data and start chatting 👇
             </div>
           )}
 
-          {messages.map((msg, index) => (
+          {activeChat?.messages.map((msg, index) => (
             <div key={index} className={`message ${msg.sender}`}>
     
               {/* Text */}
@@ -214,7 +288,7 @@ function App() {
             </div>
           ))}
 
-          {loading && (
+          {activeChat?.loading && (
             <div className="message bot">
               AI is thinking...
             </div>
@@ -277,9 +351,9 @@ function App() {
           <button
               className="chat-send-btn"
               onClick={sendMessage}
-              disabled={loading}
+              disabled={activeChat?.loading}
             >
-            {loading ? "Sending..." : "Send"}
+            {activeChat?.loading ? "Sending..." : "Send"}
             </button>
 
         </div>

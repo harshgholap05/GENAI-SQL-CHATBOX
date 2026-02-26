@@ -189,6 +189,7 @@ SYNTAX RULES:
 - SELECT statements only.
 - Use TOP for limiting results.
 - TOP must appear immediately after SELECT.
+- Use GROUP BY when TOP is included.
 - Never place TOP after ORDER BY.
 - DO NOT use LIMIT.
 - DO NOT use FETCH.
@@ -233,7 +234,7 @@ SQL:
                 "num_predict": 120
             }
         },
-        timeout=300
+        timeout=120
     )
 
     return response.json().get("response", "").strip()
@@ -540,10 +541,9 @@ async def chat(body: dict = Body(...)):
         # Chart
         chart_data = None
 
-
-        intent = detect_intent(question)
-        chart_pref = detect_chart_preference(question)
-        chart_data = auto_detect_chart(df, chart_pref)
+        if intent in["chart", "ranking", "listing"]:
+            chart_pref = detect_chart_preference(question)
+            chart_data = auto_detect_chart(df, chart_pref)
         
 
         return {

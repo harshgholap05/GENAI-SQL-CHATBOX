@@ -258,3 +258,27 @@ body {
   transform: none;
 }
 
+.chat-list {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  background: transparent;
+  transition: background 0.2s ease;
+}
+
+.chat-item:hover {
+  background: rgba(255,255,255,0.08);
+}
+
+.chat-item.active {
+  background: #4f46e5;
+  color: white;
+}
