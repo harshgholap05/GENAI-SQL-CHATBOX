@@ -311,6 +311,23 @@ Frontend badge: **🔗 5-Table JOIN** `Customers → Orders → Order_items → 
 
 ---
 
+## 🛠️ Tools Used
+
+- **Python** — Backend language
+- **FastAPI** — REST API framework
+- **SQLAlchemy + PyODBC** — Database connection and query execution
+- **Pandas** — Data processing and CSV/XLSX handling
+- **Ollama (Llama3)** — Local LLM for SQL generation and explanations
+- **Microsoft SQL Server** — Primary database
+- **React (Vite)** — Frontend framework
+- **Chart.js + react-chartjs-2** — Data visualization
+- **react-markdown** — Markdown rendering in chat
+- **JavaScript / CSS** — UI logic and styling
+- **VS Code** — Development environment
+- **Git + GitHub** — Version control
+
+---
+
 ## 🎯 Purpose
 
 This project demonstrates how a local LLM can be combined with:
