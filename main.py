@@ -9,11 +9,10 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import re
 
-
 load_dotenv()
 
-DB_SERVER = "LAPTOP-2IFF2C09"
-DB_NAME = "MyDB"
+DB_SERVER = "HARSHGHOLAP04"
+DB_NAME = "retailDB"
 DB_DRIVER = "ODBC Driver 17 for SQL Server"
 
 DATABASE_URL = (
@@ -34,12 +33,12 @@ def warm_up_llm():
         requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "qwen2.5:3b",
+                "model": "llama3",
                 "prompt": "SELECT 1",
                 "stream": False,
                 "options": {"num_predict": 5}
             },
-            timeout=30  # 👈 longer for cold start
+            timeout=30
         )
         print("LLM warmed up")
     except Exception as e:
@@ -66,20 +65,45 @@ def root():
 @app.get("/tables")
 def list_tables():
     try:
-        query = """
+        tables_query = """
         SELECT TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_TYPE = 'BASE TABLE'
         ORDER BY TABLE_NAME
         """
+
+        count_query = """
+        SELECT COUNT(*)
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_TYPE = 'BASE TABLE'
+        """
+
+        size_query = """
+        SELECT
+            SUM(size) * 8 / 1024
+        FROM sys.database_files
+        """
+
+        db_query = "SELECT DB_NAME()"
+
         with engine.connect() as conn:
-            result = conn.execute(text(query))
+            result = conn.execute(text(tables_query))
             tables = [row[0] for row in result]
 
-        return {"tables": tables}
+            table_count = conn.execute(text(count_query)).scalar()
+            db_size = conn.execute(text(size_query)).scalar()
+            db_name = conn.execute(text(db_query)).scalar()
+
+        return {
+            "database": db_name,
+            "total_tables": table_count,
+            "tables": tables,
+            "size_mb": round(db_size, 2) if db_size else 0
+        }
 
     except Exception as e:
         return {"error": str(e)}
+    
     
 
 
@@ -122,8 +146,9 @@ def load_table(table: str):
         return {
             "message": "Table loaded",
             "rows": len(df),
-            "columns": list(df.columns)
-        }
+            "columns": list(df.columns),
+            "active_table": table
+            }
 
     except Exception as e:
         return {"error": str(e)}
@@ -134,41 +159,251 @@ def load_table(table: str):
 # AI SQL AGENT HELPERS
 # -------------------------
 
-def get_table_schema(table_name: str):
+def get_table_schema(table_name: str, schema: str = "dbo"):
+
     query = """
     SELECT COLUMN_NAME, DATA_TYPE
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_NAME = :table
+      AND TABLE_SCHEMA = :schema
+    ORDER BY ORDINAL_POSITION
+    """
+
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(query),
+            {"table": table_name, "schema": schema}
+        )
+
+        return [
+            (row[0], row[1])
+            for row in result
+        ]
+
+
+def find_common_keys(schema1: list, schema2: list):
+    """
+    Find common join keys between two schemas.
+    Strategy 1: exact lowercase match (e.g. customer_id = customer_id)
+    Strategy 2: one table has 'x_id', other table has 'id' column named 'x' (e.g. Order_id ↔ OrderItemID via Orders)
+    Strategy 3: partial suffix match — col in table1 ends with _id and matches a col in table2
+    """
+    cols1 = {col.lower(): col for col, _ in schema1}
+    cols2 = {col.lower(): col for col, _ in schema2}
+
+    common = []
+
+    # Strategy 1: exact match
+    for key in cols1:
+        if key in cols2:
+            common.append((cols1[key], cols2[key]))
+
+    if common:
+        return common
+
+    # Strategy 2: cross-suffix match
+    # e.g. table1 has "order_id", table2 has "orderitemid" or "order_item_id"
+    for k1 in cols1:
+        for k2 in cols2:
+            # strip underscores and compare
+            if k1.replace("_", "") == k2.replace("_", ""):
+                common.append((cols1[k1], cols2[k2]))
+
+    if common:
+        return common
+
+    # Strategy 3: if table1 has 'order_id', check if table2 has any col containing 'order'
+    for k1 in cols1:
+        if k1.endswith("_id") or k1.endswith("id"):
+            base = k1.replace("_id", "").replace("id", "")
+            for k2 in cols2:
+                if base and base in k2:
+                    common.append((cols1[k1], cols2[k2]))
+                    break
+
+    return common
+
+
+def get_foreign_keys(table_name: str):
+    """Get foreign key relationships for a table from DB metadata."""
+    query = """
+    SELECT
+        fk.name AS fk_name,
+        tp.name AS parent_table,
+        cp.name AS parent_column,
+        tr.name AS referenced_table,
+        cr.name AS referenced_column
+    FROM sys.foreign_keys fk
+    INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+    INNER JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
+    INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+    INNER JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
+    INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+    WHERE tp.name = :table OR tr.name = :table
     """
     with engine.connect() as conn:
         result = conn.execute(text(query), {"table": table_name})
-        return [(row[0], row[1]) for row in result]
+        return [
+            {
+                "parent_table": row[1],
+                "parent_column": row[2],
+                "referenced_table": row[3],
+                "referenced_column": row[4]
+            }
+            for row in result
+        ]
 
 
+def find_join_key_via_fk(table1: str, table2: str):
+    """
+    Try to find join key using actual foreign key constraints in the DB.
+    Returns (col1, col2) or None.
+    """
+    fks = get_foreign_keys(table1)
+    for fk in fks:
+        if fk["parent_table"].lower() == table1.lower() and fk["referenced_table"].lower() == table2.lower():
+            return fk["parent_column"], fk["referenced_column"]
+        if fk["referenced_table"].lower() == table1.lower() and fk["parent_table"].lower() == table2.lower():
+            return fk["referenced_column"], fk["parent_column"]
+    return None
 
 
+def detect_join_intent(question: str):
+    """
+    Detect if the user wants a JOIN.
+    STRICT: only matches explicit 'join X to Y', 'combine X and Y', 'merge X with Y'
+    Does NOT match analytical queries like 'max price from products with name'
+    """
+    patterns = [
+        r"^join\s+(\w+)\s+(?:to|with)\s+(\w+)",
+        r"^combine\s+(\w+)\s+(?:and|with)\s+(\w+)",
+        r"^merge\s+(\w+)\s+(?:with|and)\s+(\w+)",
+    ]
+
+    q = question.strip()
+    for pattern in patterns:
+        match = re.search(pattern, q, re.IGNORECASE)
+        if match:
+            return match.group(1), match.group(2)
+
+    return None
+    """
+    Detect if the user wants a JOIN.
+    STRICT: only matches explicit 'join X to Y', 'combine X and Y', 'merge X with Y'
+    Does NOT match analytical queries like 'max price from products with name'
+    """
+    # Must be: keyword + word + connector + word (exact table name pattern)
+    patterns = [
+        r"^join\s+(\w+)\s+(?:to|with)\s+(\w+)",           # join Orders to Customers
+        r"^combine\s+(\w+)\s+(?:and|with)\s+(\w+)",        # combine Orders and Customers
+        r"^merge\s+(\w+)\s+(?:with|and)\s+(\w+)",          # merge Orders with Customers
+    ]
+
+    q = question.strip()
+    for pattern in patterns:
+        match = re.search(pattern, q, re.IGNORECASE)
+        if match:
+            return match.group(1), match.group(2)
+
+    return None
+
+
+def generate_join_sql(table1: str, table2: str, schema1: list, schema2: list,
+                       join_key1: str, join_key2: str, question: str):
+    """Ask LLM to generate a JOIN query given two tables and their schemas."""
+
+    cols1 = ", ".join(f"t1.[{col}]" for col, _ in schema1)
+    cols2 = ", ".join(f"t2.[{col}]" for col, _ in schema2)
+
+    prompt = f"""
+Generate a valid Microsoft SQL Server SELECT query using a JOIN.
+
+Table 1: [{table1}] aliased as t1
+Columns: {", ".join(col for col, _ in schema1)}
+
+Table 2: [{table2}] aliased as t2
+Columns: {", ".join(col for col, _ in schema2)}
+
+Detected join key:
+  t1.[{join_key1}] = t2.[{join_key2}]
+
+RULES:
+- Use INNER JOIN unless the question specifies LEFT/RIGHT.
+- Always prefix columns with t1. or t2. to avoid ambiguity.
+- Use SQL Server syntax only (TOP, not LIMIT).
+- Return SELECT TOP 100 if no specific limit is given.
+- Output SQL only. No explanation. No markdown. No semicolons unless at very end.
+
+User question: {question}
+
+Respond with ONLY the SQL query. Start your response with SELECT. No preamble, no explanation, no text before SELECT.
+
+SQL:
+"""
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "llama3",
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_predict": 200
+            }
+        },
+        timeout=120
+    )
+
+    return response.json().get("response", "").strip()
 
 
 def enforce_schema(sql: str, schema: list, table_name: str):
-    # Ensure table name is bracketed
-    sql = re.sub(
-        rf"\b{re.escape(table_name)}\b",
-        f"[{table_name}]",
-        sql,
-        flags=re.IGNORECASE
+
+    valid_cols = [col.lower() for col, _ in schema]
+
+    # Extract aliases defined in the SQL (AS alias) so we don't reject them
+    aliases = set(
+        m.lower() for m in re.findall(r"\bAS\s+\[?(\w+)\]?", sql, re.IGNORECASE)
     )
+
+    # Get all table names and column names from entire DB
+    try:
+        with engine.connect() as conn:
+            all_tables = set(
+                row[0].lower() for row in conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                ))
+            )
+            all_db_columns = set(
+                row[0].lower() for row in conn.execute(text(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS"
+                ))
+            )
+    except Exception:
+        all_tables = set()
+        all_db_columns = set()
+
+    used_cols = re.findall(r"\[([^\]]+)\]", sql)
+
+    for col in used_cols:
+        col_lower = col.lower()
+        # Allow if: valid col, table name, alias, any DB table, any DB column across all tables
+        if (col_lower not in valid_cols
+                and col_lower != table_name.lower()
+                and col_lower not in aliases
+                and col_lower not in all_tables
+                and col_lower not in all_db_columns):
+            raise Exception(f"Invalid column used: {col}")
+
+    sql = re.sub(r"\[\[", "[", sql)
+    sql = re.sub(r"\]\]", "]", sql)
 
     return sql
 
 
-
-
-
-
-
 def generate_sql(question: str, table_name: str, schema: list):
-    # Build column list from schema
-    columns = [col for col, _ in schema]
+    columns = ", ".join(col for col, _ in schema)
 
     prompt = f"""
 Generate a valid Microsoft SQL Server SELECT query.
@@ -189,24 +424,27 @@ SYNTAX RULES:
 - SELECT statements only.
 - Use TOP for limiting results.
 - TOP must appear immediately after SELECT.
-- Use GROUP BY when TOP is included.
 - Never place TOP after ORDER BY.
 - DO NOT use LIMIT.
 - DO NOT use FETCH.
 - DO NOT use OFFSET.
+- Use GROUP BY ONLY when aggregation functions (COUNT, SUM, AVG, MAX, MIN) are used.
+- Do NOT use GROUP BY for simple listing queries.
 - If limiting results, use SELECT TOP N.
 - The SELECT clause must include at least one column or *.
 
 AGGREGATION RULES:
-- If the question asks for "top", "highest", "lowest", or ranking,
-  you MUST use GROUP BY and an appropriate aggregation function.
-- For totals, use SUM().
-- For counts, use COUNT().
+- Use GROUP BY ONLY when aggregation functions (COUNT, SUM, AVG, MIN, MAX) are used.
+- Do NOT use GROUP BY for simple SELECT or listing queries.
+- If the question asks for "top", "highest", "lowest", or ranking:
+  • Use aggregation ONLY if totals or counts are required.
+  • Otherwise, order by the relevant column and use TOP without GROUP BY.
 - If using aggregation, the aggregated value MUST appear in the SELECT clause
   with an alias.
-  Example: SUM([Rating Count]) AS TotalRatingCount
 - When ordering by aggregation, use the alias in ORDER BY.
-
+- Never use column aliases in GROUP BY.
+- Do not use GROUP BY for simple COUNT(*) queries.
+- For counting rows or tables, use COUNT(*) without GROUP BY.
 
 FORMATTING RULES:
 - All column references in SELECT, WHERE, GROUP BY, and ORDER BY
@@ -215,18 +453,21 @@ FORMATTING RULES:
 - No explanations.
 - No markdown.
 - No comments.
+- Never double-wrap table names.
+- Use exactly one pair of square brackets.
 
 Question:
 {question}
 
-SQL:
+Respond with ONLY the SQL query. Start your response with SELECT. No preamble, no explanation, no text before SELECT.
 
+SQL:
 """
 
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={
-            "model": "qwen2.5:3b",
+            "model": "llama3",
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -243,17 +484,14 @@ SQL:
 
 def fix_top_position(sql: str):
 
-    # If TOP appears after ORDER BY, fix it
     if "ORDER BY" in sql.upper() and "TOP" in sql.upper():
 
         match = re.search(r"TOP\s+(\d+)", sql, re.IGNORECASE)
         if match:
             top_n = match.group(1)
 
-            # Remove existing TOP
             sql = re.sub(r"TOP\s+\d+", "", sql, flags=re.IGNORECASE)
 
-            # Add TOP after SELECT
             sql = re.sub(
                 r"SELECT",
                 f"SELECT TOP {top_n}",
@@ -266,34 +504,115 @@ def fix_top_position(sql: str):
 
 
 
+def fix_bracket_dot_notation(sql: str):
+    """
+    Fix incorrect bracket+dot patterns:
+    1. [TableName].[ColumnName] → TableName.[ColumnName]
+    2. [alias].ColumnName → alias.[ColumnName]  (e.g. [c].LastName → c.[LastName])
+    """
+    # Fix [TableName].[ColumnName] → TableName.[ColumnName]
+    sql = re.sub(r'\[(\w+)\]\.\[(\w+)\]', r'\1.[\2]', sql)
+    # Fix [alias].ColumnName → alias.[ColumnName]
+    sql = re.sub(r'\[(\w+)\]\.(\w+)', r'\1.[\2]', sql)
+    return sql
+
+
+def fix_missing_from(sql: str, table_name: str):
+    """If LLM forgot the FROM clause, add it."""
+    if "FROM" not in sql.upper():
+        sql = re.sub(
+            r"(SELECT\b[\s\S]+?)(\s*WHERE|\s*ORDER|\s*GROUP|\s*HAVING|$)",
+            rf"\1 FROM [{table_name}]\2",
+            sql,
+            count=1,
+            flags=re.IGNORECASE
+        )
+    return sql
+
+
 def clean_sql_output(raw_sql: str):
     # Remove markdown fences
     raw_sql = re.sub(r"```sql", "", raw_sql, flags=re.IGNORECASE)
     raw_sql = raw_sql.replace("```", "")
 
-    # Extract only the FIRST SELECT statement up to the first semicolon
+    # Find the FIRST real SELECT keyword and cut everything before it
+    select_match = re.search(r"\bSELECT\b", raw_sql, re.IGNORECASE)
+    if select_match:
+        raw_sql = raw_sql[select_match.start():]
+
+    # Find first complete SELECT statement ending at semicolon
     match = re.search(r"(SELECT[\s\S]+?;)", raw_sql, re.IGNORECASE)
-
     if match:
-        return match.group(1).strip()
+        sql = match.group(1).strip()
+    else:
+        match = re.search(r"(SELECT[\s\S]+?)(\n\n|$)", raw_sql, re.IGNORECASE)
+        sql = match.group(1).strip() if match else raw_sql.strip()
 
-    # If no semicolon, extract until first double newline
-    match = re.search(r"(SELECT[\s\S]+?)(\n\n|$)", raw_sql, re.IGNORECASE)
+    # Strip trailing natural language after SQL
+    lines = sql.splitlines()
+    sql_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if sql_lines and stripped and not any(
+            kw in stripped.upper() for kw in [
+                "SELECT", "FROM", "WHERE", "JOIN", "ON", "GROUP", "ORDER",
+                "HAVING", "INNER", "LEFT", "RIGHT", "OUTER", "TOP", "AS",
+                "AND", "OR", "BY", "DESC", "ASC", "COUNT", "SUM", "AVG",
+                "MAX", "MIN", "DISTINCT", "WITH", "UNION", "[", ")", "("
+            ]
+        ) and re.match(r'^[A-Z][a-z]', stripped):
+            break
+        sql_lines.append(line)
+
+    return "\n".join(sql_lines).strip()
+    # Remove markdown fences
+    raw_sql = re.sub(r"```sql", "", raw_sql, flags=re.IGNORECASE)
+    raw_sql = raw_sql.replace("```", "")
+
+    # Find the FIRST real SELECT keyword position and cut everything before it
+    # This strips LLM preamble like "Here is the SQL:" or "SELECT TOP 10 query that answers..."
+    select_match = re.search(r"\bSELECT\b", raw_sql, re.IGNORECASE)
+    if select_match:
+        raw_sql = raw_sql[select_match.start():]
+
+    # Now find the first complete SELECT statement ending at semicolon
+    match = re.search(r"(SELECT[\s\S]+?;)", raw_sql, re.IGNORECASE)
     if match:
-        return match.group(1).strip()
+        sql = match.group(1).strip()
+    else:
+        # No semicolon — take until double newline or end
+        match = re.search(r"(SELECT[\s\S]+?)(\n\n|$)", raw_sql, re.IGNORECASE)
+        sql = match.group(1).strip() if match else raw_sql.strip()
 
-    return raw_sql.strip()
+    # Strip any trailing natural language that crept in after the SQL
+    # e.g. "SELECT ... FROM table\n\nThis query returns..."
+    # Keep only up to the first line that doesn't look like SQL
+    lines = sql.splitlines()
+    sql_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # Stop if line looks like natural language (no SQL keywords, starts with capital word + space)
+        if sql_lines and stripped and not any(
+            kw in stripped.upper() for kw in [
+                "SELECT", "FROM", "WHERE", "JOIN", "ON", "GROUP", "ORDER",
+                "HAVING", "INNER", "LEFT", "RIGHT", "OUTER", "TOP", "AS",
+                "AND", "OR", "BY", "DESC", "ASC", "COUNT", "SUM", "AVG",
+                "MAX", "MIN", "DISTINCT", "WITH", "UNION", "[", ")", "("
+            ]
+        ) and re.match(r'^[A-Z][a-z]', stripped):
+            break
+        sql_lines.append(line)
+
+    return "\n".join(sql_lines).strip()
 
 def convert_limit_to_top(sql: str):
     match = re.search(r"LIMIT\s+(\d+)", sql, re.IGNORECASE)
     if match:
         limit_value = match.group(1)
 
-        # Remove LIMIT clause
         sql = re.sub(r"LIMIT\s+\d+;", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"LIMIT\s+\d+", "", sql, flags=re.IGNORECASE)
 
-        # Insert TOP after SELECT
         sql = re.sub(
             r"SELECT",
             f"SELECT TOP {limit_value}",
@@ -331,7 +650,6 @@ def auto_detect_chart(df: pd.DataFrame, chart_pref=None):
     numeric_col = numeric_cols[0]
     category_col = non_numeric_cols[0]
 
-    # 🔥 If user explicitly requested chart type
     if chart_pref:
         return {
             "type": chart_pref,
@@ -339,7 +657,6 @@ def auto_detect_chart(df: pd.DataFrame, chart_pref=None):
             "values": df[numeric_col].round(2).tolist()
         }
 
-    # 🔥 Otherwise auto decide
     unique_count = df[category_col].nunique()
 
     if unique_count <= 8:
@@ -353,7 +670,173 @@ def auto_detect_chart(df: pd.DataFrame, chart_pref=None):
         "values": df[numeric_col].round(2).tolist()
     }
 
+def suggest_chart(df: pd.DataFrame, question: str):
+    """
+    Use actual data to suggest a chart — no hallucination.
+    Returns suggestion dict or None if chart not appropriate.
+    """
+    # Hard rules first — no LLM needed
+    if df.shape[1] < 2 or len(df) < 2:
+        return None
+
+    numeric_cols = list(df.select_dtypes(include="number").columns)
+    non_numeric_cols = list(df.select_dtypes(exclude="number").columns)
+
+    if not numeric_cols or not non_numeric_cols:
+        return None
+
+    # Build a small sample to show LLM — max 5 rows, real data
+    sample = df.head(5).to_string(index=False)
+    columns_info = ", ".join(
+        f"{col} ({'numeric' if col in numeric_cols else 'text'})"
+        for col in df.columns
+    )
+
+    prompt = f"""You are a data visualization expert. Look at this query result and suggest the best chart.
+
+Question asked: {question}
+
+Columns: {columns_info}
+
+Sample data (first 5 rows):
+{sample}
+
+Rules:
+- Only suggest a chart if data has at least 1 numeric and 1 text/category column
+- chart_type must be ONLY one of: bar, pie, line
+- Use pie only if there are 8 or fewer unique categories
+- Use line only if data has time/date or sequential ordering
+- Use bar for comparisons and rankings
+- x_column must be an EXACT column name from the data
+- y_column must be an EXACT numeric column name from the data
+- reason must be 1 short sentence explaining why
+
+Respond ONLY with valid JSON like this (no markdown, no explanation):
+{{"should_suggest": true, "chart_type": "bar", "x_column": "ProductName", "y_column": "Price", "reason": "Comparing prices across products"}}
+
+If chart is not appropriate respond with:
+{{"should_suggest": false}}"""
+
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 100}
+            },
+            timeout=30
+        )
+        raw = response.json().get("response", "").strip()
+
+        # Clean JSON — remove markdown fences if any
+        raw = re.sub(r"```json|```", "", raw).strip()
+
+        # Find first JSON object
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if not match:
+            return None
+
+        result = __import__('json').loads(match.group(0))
+
+        if not result.get("should_suggest"):
+            return None
+
+        chart_type = result.get("chart_type", "").lower()
+        if chart_type not in ["bar", "pie", "line"]:
+            return None
+
+        x_col = result.get("x_column")
+        y_col = result.get("y_column")
+
+        # Validate columns actually exist in dataframe
+        if x_col not in df.columns or y_col not in df.columns:
+            return None
+
+        # Validate y_col is actually numeric
+        if y_col not in numeric_cols:
+            return None
+
+        return {
+            "chart_type": chart_type,
+            "x_column": x_col,
+            "y_column": y_col,
+            "reason": result.get("reason", ""),
+            "labels": df[x_col].astype(str).tolist(),
+            "values": df[y_col].round(2).tolist()
+        }
+
+    except Exception as e:
+        print("Chart suggestion error:", repr(e))
+        return None
+
+
 def explain_result(question: str, df: pd.DataFrame, intent: str):
+
+    total_rows = len(df)
+    sample_text = df.head(10).to_string(index=False)
+
+    if intent == "list" or intent == "ranking":
+        prompt = f"""
+User question:
+{question}
+
+Result rows:
+{sample_text}
+
+Return ONLY the list in structured format.
+Do not add commentary.
+Do not add explanations.
+Do not add introductory sentences.
+"""
+
+    elif intent == "summary":
+        prompt = f"""
+User question:
+{question}
+
+Total rows: {total_rows}
+
+Result preview:
+{sample_text}
+
+Provide a high-level analytical summary.
+Do not repeat rows.
+Identify patterns, highest and lowest values,
+and relationships between columns.
+Be concise and insightful.
+"""
+
+    else:
+        prompt = f"""
+User question:
+{question}
+
+Result preview:
+{sample_text}
+
+Answer clearly and naturally.
+Base the answer strictly on the result data.
+Do not add extra information.
+Keep it concise.
+"""
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "llama3",
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 200
+            }
+        },
+        timeout=120
+    )
+
+    return response.json().get("response", "").strip()
 
     total_rows = len(df)
     sample_text = df.head(10).to_string(index=False)
@@ -404,7 +887,7 @@ Base the answer strictly on the result data.
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={
-            "model": "qwen2.5:3b",
+            "model": "llama3",
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -418,42 +901,96 @@ Base the answer strictly on the result data.
     return response.json().get("response", "").strip()
 
 
+def is_meta_question(question: str):
+    """Detect if user is asking ABOUT the loaded table, not querying it."""
+    q = question.lower()
+    return any(phrase in q for phrase in [
+        "what is this", "what is the table", "what is this table",
+        "describe", "tell me about", "what does this table",
+        "about this data", "about the data", "what columns",
+        "what fields", "table structure", "what data", "what kind",
+        "what type", "explain this", "explain the table",
+        "overview of", "what info", "what information",
+        "show all column", "show columns", "column names",
+        "all columns", "list columns", "list fields"
+    ])
 
 
+def answer_meta_question(table_name: str, schema: list):
+    """Answer meta questions directly from schema — no SQL needed."""
+    col_lines = "\n".join(
+        f"  - {col} ({dtype})" for col, dtype in schema
+    )
+    return (
+        f"The **{table_name}** table has {len(schema)} columns:\n\n"
+        f"{col_lines}\n\n"
+        f"This table appears to store **{table_name.lower()}** related records. "
+        f"You can ask me things like:\n"
+        f"  - Show top 10 rows\n"
+        f"  - Count total records\n"
+        f"  - Show summary / overview"
+    )
 
-@app.post("/chart")
-async def generate_chart(body: dict = Body(...)):
-    question = body.get("message")
 
-    if not question:
-        return {"error": "Empty question"}
+def is_db_question(question: str):
+    """Detect if user is asking about the DATABASE itself (not a specific table)."""
+    q = question.lower()
+    return any(phrase in q for phrase in [
+        "how many tables", "total tables", "number of tables",
+        "list all tables", "show all tables", "what tables",
+        "which tables", "tables in db", "tables in database",
+        "tables in this db", "tables in this database",
+        "database size", "db size", "size of db", "size of database",
+        "database name", "db name", "what is the db", "what is the database",
+        "what db", "tell me about the db", "tell me about the database",
+        "database info", "db info", "database overview", "db overview"
+    ])
 
-    if not active_filename:
-        return {"error": "No table loaded"}
 
-    # 1️⃣ Generate SQL
-    schema = get_table_schema(active_filename)
-    sql = generate_sql(question, active_filename, schema)
+def answer_db_question(question: str):
+    """Answer DB-level questions directly from INFORMATION_SCHEMA — no LLM needed."""
+    q = question.lower()
 
-    if not is_safe_sql(sql):
-        return {"error": "Unsafe SQL blocked", "sql": sql}
+    with engine.connect() as conn:
+        db_name = conn.execute(text("SELECT DB_NAME()")).scalar()
+        table_count = conn.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+        )).scalar()
+        tables = [
+            row[0] for row in conn.execute(text(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"
+            ))
+        ]
+        db_size = conn.execute(text(
+            "SELECT SUM(size) * 8 / 1024 FROM sys.database_files"
+        )).scalar()
 
-    # 2️⃣ Execute SQL
-    df = execute_sql(sql)
+    table_list = "\n".join(f"  - {t}" for t in tables)
 
-    if df.empty:
-        return {"error": "No data returned"}
+    # Answer based on what they asked
+    if any(p in q for p in ["how many", "total", "number of"]):
+        return (
+            f"The **{db_name}** database has **{table_count} tables**:\n\n"
+            f"{table_list}"
+        )
 
-    # 3️⃣ Auto-detect chart type
-    
-    intent = detect_intent(question)
-    chart = auto_detect_chart(df, intent)
-    
+    if any(p in q for p in ["size", "how big"]):
+        return f"The **{db_name}** database is **{round(db_size, 2)} MB** in size."
 
-    return {
-        "sql": sql,
-        "chart": chart
-    }
+    if any(p in q for p in ["list", "show", "what tables", "which tables"]):
+        return (
+            f"The **{db_name}** database contains **{table_count} tables**:\n\n"
+            f"{table_list}"
+        )
+
+    # General DB overview
+    return (
+        f"**Database:** {db_name}\n"
+        f"**Total Tables:** {table_count}\n"
+        f"**Size:** {round(db_size, 2)} MB\n\n"
+        f"**Tables:**\n{table_list}"
+    )
 
 
 def detect_intent(question: str):
@@ -474,8 +1011,379 @@ def detect_intent(question: str):
     return "general"
 
 
+def is_row_query(question: str):
+    """Returns True when user is simply fetching rows — no explanation needed."""
+    q = question.lower()
+    return any(phrase in q for phrase in [
+        "show me", "show top", "show all", "get top", "get me",
+        "top ", "fetch", "list all", "display", "give me",
+        "first ", "last ", "select", "rows", "records"
+    ])
 
-# ---- chat endpoint (TEMP, no Gemini yet) ----
+
+def user_wants_chart(question: str):
+    """Returns True ONLY if user explicitly asks for a chart/graph/plot."""
+    q = question.lower()
+    return any(word in q for word in [
+        "chart", "plot", "graph", "visualize", "visualization",
+        "pie chart", "bar chart", "line chart", "scatter",
+        "show chart", "draw", "diagram"
+    ])
+
+
+def generate_sql_all_tables(question: str):
+    """
+    When no table is selected, give LLM the full DB schema and let it
+    generate any SQL query — single table, JOIN, subquery, anything.
+    """
+    try:
+        # Fetch all tables and their schemas dynamically
+        with engine.connect() as conn:
+            all_tables = [
+                row[0] for row in conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                ))
+            ]
+
+        # Build full schema description
+        schema_text = ""
+        all_schemas = {}
+        for table in all_tables:
+            schema = get_table_schema(table)
+            all_schemas[table] = schema
+            cols = ", ".join(f"{col} ({dtype})" for col, dtype in schema)
+            schema_text += f"\nTable [{table}]: {cols}"
+
+        # Build FK relationships for prompt
+        fk_info = ""
+        try:
+            with engine.connect() as conn:
+                fk_rows = conn.execute(text("""
+                    SELECT
+                        tp.name AS parent_table,
+                        cp.name AS parent_column,
+                        tr.name AS referenced_table,
+                        cr.name AS referenced_column
+                    FROM sys.foreign_keys fk
+                    INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                    INNER JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
+                    INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+                    INNER JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
+                    INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+                """))
+                fk_lines = [
+                    f"  [{r[0]}].{r[1]} → [{r[2]}].{r[3]}"
+                    for r in fk_rows
+                ]
+                fk_info = "\n".join(fk_lines)
+        except Exception:
+            fk_info = "  (FK info unavailable)"
+
+        prompt = f"""
+You are a Microsoft SQL Server expert. Given the full database schema and FK relationships, write a SQL query.
+
+DATABASE SCHEMA:
+{schema_text}
+
+FOREIGN KEY RELATIONSHIPS (ONLY valid JOIN paths):
+{fk_info}
+
+STRICT RULES:
+- Use ONLY the FK relationships listed above to JOIN tables
+- NEVER join tables that don't have a direct FK relationship
+- Use table aliases (t1, t2, t3...) with FROM [Table1] AS t1
+- ALWAYS use alias.[ColumnName] format — NEVER [Table].[Column]
+- Use TOP N instead of LIMIT
+- Wrap all column/table names in square brackets
+- Return ONLY the SQL query starting with SELECT. No explanation.
+
+Question: {question}
+SQL:"""
+
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 300}
+            },
+            timeout=120
+        )
+
+        raw_sql = response.json().get("response", "").strip()
+        sql = clean_sql_output(raw_sql)
+        sql = fix_top_position(sql)
+        sql = fix_bracket_dot_notation(sql)
+        sql = convert_limit_to_top(sql)
+        sql = sql.rstrip(";")
+        sql = sql.replace("[[", "[").replace("]]", "]")
+
+        print("All-tables SQL:", sql)
+
+        if not is_safe_sql(sql):
+            return {"error": "Unsafe SQL blocked"}
+
+        df = execute_sql(sql)
+        print("Rows returned:", len(df))
+
+        if df.empty:
+            return {"reply": "No results found.", "chart": None, "table_data": None}
+
+        table_preview = {
+            "columns": list(df.columns),
+            "rows": df.head(100).fillna("").values.tolist()
+        }
+
+        intent = detect_intent(question)
+        explanation = "" if is_row_query(question) else explain_result(question, df, intent)
+        chart_data = auto_detect_chart(df, detect_chart_preference(question)) if user_wants_chart(question) else None
+
+        # Chart suggestion — only if user didn't ask for chart
+        chart_suggestion = None
+        if not user_wants_chart(question):
+            chart_suggestion = suggest_chart(df, question)
+
+        return {
+            "reply": explanation,
+            "chart": chart_data,
+            "table_data": table_preview,
+            "chart_suggestion": chart_suggestion
+        }
+
+    except Exception as e:
+        print("All-tables SQL error:", repr(e))
+        return {"error": str(e)}
+
+
+def build_join_chain(relevant_tables: list, table_schemas: dict):
+    """
+    Build a chain of JOINable tables using FK relationships.
+    Returns ordered list of (table, join_key_on_this, prev_table_key) tuples.
+    Example: Customers → Orders → Order_items → Products → Categories
+    """
+    if not relevant_tables:
+        return []
+
+    # Build adjacency map using FK relationships
+    def get_link(t1, t2):
+        fk = find_join_key_via_fk(t1, t2)
+        if fk:
+            return fk
+        common = find_common_keys(table_schemas[t1], table_schemas[t2])
+        if common:
+            return common[0]
+        return None
+
+    # Try to build a connected chain starting from each table
+    from itertools import permutations
+
+    best_chain = []
+
+    for start in relevant_tables:
+        chain = [start]
+        remaining = [t for t in relevant_tables if t != start]
+
+        while remaining:
+            found = False
+            for t in remaining:
+                # Check if t connects to any table already in chain
+                for existing in chain:
+                    link = get_link(existing, t)
+                    if link:
+                        chain.append(t)
+                        remaining.remove(t)
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                break  # No more connections possible
+
+        if len(chain) > len(best_chain):
+            best_chain = chain
+
+    return best_chain
+
+
+def generate_multistep_join_sql(chain: list, table_schemas: dict, question: str):
+    """
+    Generate SQL for a multi-table JOIN chain.
+    chain = [table1, table2, table3, ...]
+    """
+    if len(chain) < 2:
+        return None
+
+    # Build schema description for prompt
+    schema_parts = []
+    alias_map = {}
+    for i, table in enumerate(chain):
+        alias = f"t{i+1}"
+        alias_map[table] = alias
+        cols = ", ".join(col for col, _ in table_schemas[table])
+        schema_parts.append(f"[{table}] alias={alias}: {cols}")
+
+    # Build JOIN conditions
+    join_conditions = []
+    for i in range(len(chain) - 1):
+        t1, t2 = chain[i], chain[i+1]
+        a1, a2 = alias_map[t1], alias_map[t2]
+        fk = find_join_key_via_fk(t1, t2)
+        if not fk:
+            common = find_common_keys(table_schemas[t1], table_schemas[t2])
+            if common:
+                fk = common[0]
+        if fk:
+            join_conditions.append(
+                f"JOIN [{t2}] AS {a2} ON {a1}.[{fk[0]}] = {a2}.[{fk[1]}]"
+            )
+
+    tables_info = "\n".join(schema_parts)
+    joins_info = "\n".join(join_conditions)
+    alias_info = "\n".join(f"  {alias} = [{table}]" for table, alias in alias_map.items())
+
+    prompt = f"""
+You are a Microsoft SQL Server expert. Write a SQL query using multiple JOINs.
+
+TABLE ALIASES (use ONLY these aliases):
+{alias_info}
+
+TABLE COLUMNS:
+{tables_info}
+
+JOIN STRUCTURE (use exactly this):
+FROM [{chain[0]}] AS t1
+{joins_info}
+
+STRICT RULES:
+- Use ONLY the aliases listed above (t1, t2, t3 etc)
+- ALWAYS use alias.[ColumnName] format — e.g. t1.[FirstName], t2.[Order_id]
+- NEVER use table name directly — only aliases
+- NEVER use [Table].[Column] — only alias.[Column]
+- Use TOP N instead of LIMIT
+- Wrap all column names in square brackets []
+- Return ONLY the SQL query starting with SELECT. No explanation.
+
+Question: {question}
+SQL:"""
+
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "llama3",
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": 400}
+        },
+        timeout=120
+    )
+
+    return response.json().get("response", "").strip()
+
+
+def try_smart_multitable(question: str):
+    """
+    Detects if a question needs data from multiple tables.
+    Supports 2, 3, 4, or 5 table JOINs automatically.
+    """
+    try:
+        with engine.connect() as conn:
+            all_tables = [
+                row[0] for row in conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                ))
+            ]
+
+        q = question.lower()
+        table_schemas = {t: get_table_schema(t) for t in all_tables}
+
+        # Find relevant tables by name or column mention in question
+        relevant_tables = []
+        for table, schema in table_schemas.items():
+            col_names = [col.lower() for col, _ in schema]
+            if table.lower() in q or any(col in q for col in col_names):
+                relevant_tables.append(table)
+
+        if len(relevant_tables) < 2:
+            return None
+
+        # Build best possible JOIN chain
+        chain = build_join_chain(relevant_tables, table_schemas)
+
+        if len(chain) < 2:
+            return None
+
+        print(f"Multi-step JOIN chain: {' → '.join(chain)}")
+
+        # Generate SQL for the chain
+        if len(chain) == 2:
+            # Simple 2-table JOIN
+            t1, t2 = chain[0], chain[1]
+            fk = find_join_key_via_fk(t1, t2)
+            if not fk:
+                common = find_common_keys(table_schemas[t1], table_schemas[t2])
+                fk = common[0] if common else None
+            if not fk:
+                return None
+            raw_sql = generate_join_sql(t1, t2, table_schemas[t1], table_schemas[t2], fk[0], fk[1], question)
+        else:
+            # Multi-step JOIN (3+ tables)
+            raw_sql = generate_multistep_join_sql(chain, table_schemas, question)
+
+        if not raw_sql:
+            return None
+
+        sql = clean_sql_output(raw_sql)
+        sql = fix_top_position(sql)
+        sql = fix_bracket_dot_notation(sql)
+        sql = convert_limit_to_top(sql)
+        sql = sql.rstrip(";")
+        sql = sql.replace("[[", "[").replace("]]", "]")
+
+        print(f"Multi-step SQL: {sql}")
+
+        if not is_safe_sql(sql):
+            return None
+
+        df = execute_sql(sql)
+
+        if df.empty:
+            return {"reply": "No results found.", "chart": None, "table_data": None}
+
+        table_preview = {
+            "columns": list(df.columns),
+            "rows": df.head(100).fillna("").values.tolist()
+        }
+
+        explanation = "" if is_row_query(question) else explain_result(question, df, detect_intent(question))
+        chart_data = auto_detect_chart(df, detect_chart_preference(question)) if user_wants_chart(question) else None
+
+        # Chart suggestion
+        chart_suggestion = None
+        if not user_wants_chart(question):
+            chart_suggestion = suggest_chart(df, question)
+
+        join_key_str = " → ".join(chain)
+        table1 = chain[0]
+        table2 = chain[-1]
+
+        return {
+            "reply": explanation,
+            "chart": chart_data,
+            "table_data": table_preview,
+            "sql": sql,
+            "isJoin": True,
+            "join_key": join_key_str,
+            "table1": table1,
+            "table2": table2,
+            "rows": len(df),
+            "all_common_keys": chain,
+            "chart_suggestion": chart_suggestion
+        }
+
+    except Exception as e:
+        print("Smart multitable error:", repr(e))
+        return None
 
 
 def detect_chart_preference(question: str):
@@ -490,8 +1398,176 @@ def detect_chart_preference(question: str):
     if "scatter" in q:
         return "scatter"
 
-    return None  # no specific preference
-    
+    return None
+
+
+# -------------------------
+# JOIN ENDPOINT
+# -------------------------
+
+@app.post("/join")
+async def join_tables(body: dict = Body(...)):
+    try:
+        question = body.get("message", "")
+
+        # 1. Detect table names from the question
+        join_pair = detect_join_intent(question)
+        if not join_pair:
+            return {"error": "Could not detect two table names for JOIN. Try: 'join Orders to Customers'"}
+
+        table1_raw, table2_raw = join_pair
+
+        # 2. Validate tables exist in DB
+        with engine.connect() as conn:
+            existing = [
+                row[0].lower()
+                for row in conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                ))
+            ]
+
+        def resolve_table(name):
+            for t in existing:
+                if t == name.lower():
+                    # Return actual cased name
+                    break
+            # get actual casing
+            with engine.connect() as conn:
+                result = conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE LOWER(TABLE_NAME) = :name AND TABLE_TYPE='BASE TABLE'"
+                ), {"name": name.lower()})
+                row = result.fetchone()
+                return row[0] if row else None
+
+        table1 = resolve_table(table1_raw)
+        table2 = resolve_table(table2_raw)
+
+        if not table1:
+            return {"error": f"Table '{table1_raw}' not found in database."}
+        if not table2:
+            return {"error": f"Table '{table2_raw}' not found in database."}
+
+        # 3. Get schemas
+        schema1 = get_table_schema(table1)
+        schema2 = get_table_schema(table2)
+
+        # 4. Find join key — try FK first, then column name matching
+        join_key1, join_key2 = None, None
+
+        # Strategy 1: actual foreign key constraints in DB
+        fk_result = find_join_key_via_fk(table1, table2)
+        if fk_result:
+            join_key1, join_key2 = fk_result
+            all_common_keys = [f"{join_key1} = {join_key2}"]
+            print(f"JOIN via FK: {table1}.{join_key1} = {table2}.{join_key2}")
+        else:
+            # Strategy 2: common column name matching
+            common_keys = find_common_keys(schema1, schema2)
+            if common_keys:
+                join_key1, join_key2 = common_keys[0]
+                all_common_keys = [f"{k1} = {k2}" for k1, k2 in common_keys]
+                print(f"JOIN via column match: {table1}.{join_key1} = {table2}.{join_key2}")
+            else:
+                all_common_keys = []
+
+        if not join_key1:
+            return {
+                "error": f"No common columns found between '{table1}' and '{table2}'. Cannot auto-detect JOIN key.",
+                "table1_name": table1,
+                "table2_name": table2,
+                "table1_columns": [f"{col} ({dtype})" for col, dtype in schema1],
+                "table2_columns": [f"{col} ({dtype})" for col, dtype in schema2],
+            }
+
+        # 5. Generate SQL via LLM
+        raw_sql = generate_join_sql(table1, table2, schema1, schema2,
+                                     join_key1, join_key2, question)
+        sql = clean_sql_output(raw_sql)
+        sql = fix_top_position(sql)
+        sql = convert_limit_to_top(sql)
+        sql = sql.rstrip(";")
+        sql = sql.replace("[[", "[").replace("]]", "]")
+
+        print("JOIN SQL:", sql)
+
+        if not is_safe_sql(sql):
+            return {"error": "Unsafe SQL blocked", "sql": sql}
+
+        # 6. Execute
+        df = execute_sql(sql)
+
+        if df.empty:
+            return {
+                "reply": f"JOIN executed but returned no rows.",
+                "sql": sql,
+                "join_key": f"{table1}.{join_key1} = {table2}.{join_key2}",
+                "table_data": None,
+                "chart": None
+            }
+
+        # 7. Build table preview (first 50 rows)
+        table_preview = {
+            "columns": list(df.columns),
+            "rows": df.head(50).fillna("").values.tolist()
+        }
+
+        # 8. Chart
+        intent = detect_intent(question)
+        chart_pref = detect_chart_preference(question)
+        chart_data = auto_detect_chart(df, chart_pref)
+
+        # 9. Explanation
+        explanation = explain_result(question, df, intent)
+
+        return {
+            "reply": explanation,
+            "sql": sql,
+            "join_key": f"{table1}.{join_key1} = {table2}.{join_key2}",
+            "table1": table1,
+            "table2": table2,
+            "rows": len(df),
+            "table_data": table_preview,
+            "chart": chart_data,
+            "all_common_keys": all_common_keys
+        }
+
+    except Exception as e:
+        print("JOIN ERROR:", repr(e))
+        return {"error": str(e)}
+
+
+@app.post("/chart")
+async def generate_chart(body: dict = Body(...)):
+    question = body.get("message")
+
+    if not question:
+        return {"error": "Empty question"}
+
+    if not active_filename:
+        return {"error": "No table loaded"}
+
+    schema = get_table_schema(active_filename)
+    sql = generate_sql(question, active_filename, schema)
+
+    if not is_safe_sql(sql):
+        return {"error": "Unsafe SQL blocked", "sql": sql}
+
+    df = execute_sql(sql)
+
+    if df.empty:
+        return {"error": "No data returned"}
+
+    intent = detect_intent(question)
+    chart = auto_detect_chart(df, intent)
+
+    return {
+        "sql": sql,
+        "chart": chart
+    }
+
+
+# ---- chat endpoint ----
 
 @app.post("/chat")
 async def chat(body: dict = Body(...)):
@@ -501,25 +1577,55 @@ async def chat(body: dict = Body(...)):
         if not question:
             return {"error": "Empty question"}
 
+        # ---- DB-level question: answer from INFORMATION_SCHEMA, no table needed ----
+        if is_db_question(question):
+            return {
+                "reply": answer_db_question(question),
+                "chart": None
+            }
+
         if not active_filename:
-            return {"error": "No table loaded"}
+            # No table selected — try smart multitable across ALL tables
+            multi_table_result = try_smart_multitable(question)
+            if multi_table_result:
+                return multi_table_result
+
+            # Fallback: generate SQL using full DB schema context
+            return generate_sql_all_tables(question)
 
         schema = get_table_schema(active_filename)
 
+        print("Using table:", active_filename)
+        print("Columns:", schema)
+
+        # ---- Meta question: user is asking ABOUT the table, not querying it ----
+        if is_meta_question(question):
+            return {
+                "reply": answer_meta_question(active_filename, schema),
+                "chart": None
+            }
+
+        # ---- Smart multi-table detection ----
+        multi_table_result = try_smart_multitable(question)
+        if multi_table_result:
+            return multi_table_result
+
         raw_sql = generate_sql(question, active_filename, schema)
         sql = clean_sql_output(raw_sql)
-        sql= fix_top_position(sql)
+        sql = fix_top_position(sql)
+        sql = fix_missing_from(sql, active_filename)
         sql = convert_limit_to_top(sql)
         sql = enforce_schema(sql, schema, active_filename)
+        sql = re.sub(
+            r"TABLE_CATALOG\s*=\s*'your_database_name'",
+            f"TABLE_CATALOG = '{DB_NAME}'",
+            sql,
+            flags=re.IGNORECASE
+        )
         sql = sql.rstrip(";")
-        
-
-
-
+        sql = sql.replace("[[", "[").replace("]]", "]")
 
         print("Generated SQL:", sql)
-        
-        chart_data = None
 
         if not is_safe_sql(sql):
             return {"error": "Unsafe SQL blocked", "sql": sql}
@@ -527,28 +1633,42 @@ async def chat(body: dict = Body(...)):
         df = execute_sql(sql)
         print("Rows returned:", len(df))
 
-        # Explanation
         intent = detect_intent(question)
 
         if len(df) == 0:
             explanation = "No results found."
+        elif user_wants_chart(question):
+            explanation = ""  # chart request — no text needed
+        elif is_row_query(question):
+            explanation = ""  # just showing rows — no text needed, table speaks for itself
         elif len(df) <= 50:
             explanation = explain_result(question, df, intent)
         else:
-            explanation = f"I found {len(df)} matching records.\n\n"
-            explanation += explain_result(question, df.head(10), intent)
+            explanation = f"Found {len(df)} records."
 
-        # Chart
         chart_data = None
 
-        if intent in["chart", "ranking", "listing"]:
+        # Only generate chart if user EXPLICITLY asked for one
+        if user_wants_chart(question):
             chart_pref = detect_chart_preference(question)
             chart_data = auto_detect_chart(df, chart_pref)
-        
+
+        # Always return table preview so frontend renders rows as a table
+        table_preview = {
+            "columns": list(df.columns),
+            "rows": df.head(100).fillna("").values.tolist()
+        } if not df.empty else None
+
+        # Auto chart suggestion — only if user didn't ask for chart
+        chart_suggestion = None
+        if not user_wants_chart(question) and not df.empty:
+            chart_suggestion = suggest_chart(df, question)
 
         return {
-            "reply": explanation,
-            "chart": chart_data
+            "reply": explanation if not user_wants_chart(question) else "",
+            "chart": chart_data,
+            "table_data": table_preview,
+            "chart_suggestion": chart_suggestion
         }
 
     except Exception as e:

@@ -1,4 +1,23 @@
 fastapi
 uvicorn
-gemini
 python-dotenv
+requests
+pyodbc
+pandas
+sqlalchemy
+python-multipart
+openpyxl
+
+"
+|                 Package                        |       Use Case            |
+|------------------------------------------------|---------------------------|
+| Usereact + react-dom                          | Cor React
+| vite + @vitejs/plugin-react                    | Build tool
+| chart.js + react-chartjs-2                     | Charts 
+| react-markdown                                 | Markdown rendering in chat
+| eslint + plugins                               | Code linting  
+| @types/react + @types/react-dom                | TypeScript types
+| globals                                        | ESLint globals Config 
+|------------------------------------------------|---------------------------|
+"
+
