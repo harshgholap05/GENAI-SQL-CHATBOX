@@ -1,5 +1,6 @@
 from asyncio import timeout
-from fastapi import FastAPI, UploadFile, File, Body
+from fastapi import FastAPI, UploadFile, File, Body, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import pyodbc
@@ -8,7 +9,9 @@ import os
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import re
-
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 load_dotenv()
 
@@ -23,6 +26,42 @@ DATABASE_URL = (
 )
 
 engine = create_engine(DATABASE_URL)
+
+# ---- Auth Config ----
+SECRET_KEY = "genai-sql-secret-key-change-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    email = decode_token(token)
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return email
 
 
 app = FastAPI(title="GenAI SQL Chatbot")
@@ -53,9 +92,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- shared in-memory dataset ----
-active_dataframe = None
-active_filename = None
+# ---- Per-user sessions (replaces global active_filename) ----
+user_sessions = {}
+# Structure: { "email": { "active_filename": "Orders", "active_dataframe": df } }
+
+def get_session(email: str) -> dict:
+    if email not in user_sessions:
+        user_sessions[email] = {"active_filename": None, "active_dataframe": None}
+    return user_sessions[email]
 
 
 
@@ -110,9 +154,8 @@ def list_tables():
 
 # ---- upload endpoint ----
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    global active_dataframe, active_filename
-
+async def upload(file: UploadFile = File(...), current_user: str = Depends(get_current_user)):
+    session = get_session(current_user)
     try:
         if file.filename.endswith(".csv"):
             df = pd.read_csv(file.file)
@@ -121,8 +164,8 @@ async def upload(file: UploadFile = File(...)):
         else:
             return {"error": "Only CSV or XLSX allowed"}
 
-        active_dataframe = df
-        active_filename = file.filename
+        session["active_dataframe"] = df
+        session["active_filename"] = file.filename
 
         return {
             "message": "Upload successful",
@@ -132,33 +175,298 @@ async def upload(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
-    
-@app.get("/load-table/{table}")
-def load_table(table: str):
-    global active_dataframe, active_filename
 
+@app.get("/load-table/{table}")
+def load_table(table: str, current_user: str = Depends(get_current_user)):
+    session = get_session(current_user)
     try:
         query = f"SELECT TOP 100 * FROM [{table}]"
         df = pd.read_sql(query, engine)
 
-        active_dataframe = df
-        active_filename = table
+        session["active_dataframe"] = df
+        session["active_filename"] = table
 
         return {
             "message": "Table loaded",
             "rows": len(df),
             "columns": list(df.columns),
             "active_table": table
-            }
+        }
 
     except Exception as e:
         return {"error": str(e)}
 
 
+@app.post("/clear-table")
+def clear_table(current_user: str = Depends(get_current_user)):
+    session = get_session(current_user)
+    session["active_dataframe"] = None
+    session["active_filename"] = None
+    return {"message": "Cleared — Full DB Mode active"}
+
 
 # -------------------------
-# AI SQL AGENT HELPERS
+# AUTH ENDPOINTS
 # -------------------------
+
+@app.post("/register")
+async def register(body: dict = Body(...)):
+    username = body.get("username", "").strip()
+    email = body.get("email", "").strip().lower()
+    password = body.get("password", "").strip()
+
+    if not username or not email or not password:
+        raise HTTPException(status_code=400, detail="All fields are required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    hashed = hash_password(password)
+
+    try:
+        with engine.begin() as conn:
+            # Check if email already exists
+            existing = conn.execute(
+                text("SELECT id FROM Users WHERE email = :email"),
+                {"email": email}
+            ).fetchone()
+            if existing:
+                raise HTTPException(status_code=400, detail="Email already registered")
+
+            conn.execute(text("""
+                INSERT INTO Users (username, email, hashed_password, auth_provider, created_at)
+                VALUES (:username, :email, :hashed, 'local', GETDATE())
+            """), {"username": username, "email": email, "hashed": hashed})
+
+        token = create_access_token({"sub": email})
+        return {"token": token, "username": username, "email": email}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/login")
+async def login(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    password = body.get("password", "").strip()
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+
+    try:
+        with engine.begin() as conn:
+            user = conn.execute(
+                text("SELECT id, username, hashed_password FROM Users WHERE email = :email AND auth_provider = 'local'"),
+                {"email": email}
+            ).fetchone()
+
+            if not user or not verify_password(password, user[2]):
+                raise HTTPException(status_code=401, detail="Invalid email or password")
+
+            # Update last login
+            conn.execute(
+                text("UPDATE Users SET last_login = GETDATE() WHERE email = :email"),
+                {"email": email}
+            )
+
+        token = create_access_token({"sub": email})
+        return {"token": token, "username": user[1], "email": email}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/me")
+async def get_me(current_user: str = Depends(get_current_user)):
+    try:
+        with engine.connect() as conn:
+            user = conn.execute(
+                text("SELECT username, email, created_at, last_login FROM Users WHERE email = :email"),
+                {"email": current_user}
+            ).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {
+            "username": user[0],
+            "email": user[1],
+            "created_at": str(user[2]),
+            "last_login": str(user[3])
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------
+# ADMIN ENDPOINTS
+# -------------------------
+
+ADMIN_EMAIL = "harshgholap117@gmail.com"  # Change to your email
+
+def require_admin(current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Admin access only")
+    return current_user
+
+
+@app.get("/admin/users")
+async def admin_get_users(admin: str = Depends(require_admin)):
+    """Get all users — password hidden."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, username, email, auth_provider, 
+                       created_at, last_login
+                FROM Users
+                ORDER BY created_at DESC
+            """)).fetchall()
+
+        users = [
+            {
+                "id": r[0],
+                "username": r[1],
+                "email": r[2],
+                "auth_provider": r[3],
+                "created_at": str(r[4]),
+                "last_login": str(r[5]) if r[5] else "Never",
+            }
+            for r in rows
+        ]
+        return {"total": len(users), "users": users}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/reset-password")
+async def admin_reset_password(body: dict = Body(...), admin: str = Depends(require_admin)):
+    """Reset any user's password."""
+    email = body.get("email", "").strip().lower()
+    new_password = body.get("new_password", "").strip()
+
+    if not email or not new_password:
+        raise HTTPException(status_code=400, detail="Email and new_password required")
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    try:
+        hashed = hash_password(new_password)
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("UPDATE Users SET hashed_password = :hashed WHERE email = :email"),
+                {"hashed": hashed, "email": email}
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"User '{email}' not found")
+
+        return {"message": f"Password reset successfully for {email}"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/admin/delete-user")
+async def admin_delete_user(body: dict = Body(...), admin: str = Depends(require_admin)):
+    """Delete a user by email."""
+    email = body.get("email", "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    if email == ADMIN_EMAIL:
+        raise HTTPException(status_code=400, detail="Cannot delete admin account")
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("DELETE FROM Users WHERE email = :email"),
+                {"email": email}
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"User '{email}' not found")
+
+        return {"message": f"User '{email}' deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------------
+# CHAT HISTORY ENDPOINTS
+# -------------------------
+
+@app.get("/history")
+async def get_history(current_user: str = Depends(get_current_user)):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT chat_id, chat_title, messages, updated_at
+                FROM ChatHistory
+                WHERE user_email = :email
+                ORDER BY updated_at DESC
+            """), {"email": current_user}).fetchall()
+        import json
+        chats = []
+        for row in rows:
+            try:
+                messages = json.loads(row[2]) if row[2] else []
+            except:
+                messages = []
+            chats.append({"id": row[0], "title": row[1], "messages": messages, "loading": False})
+        return {"chats": chats}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/history/save")
+async def save_chat(body: dict = Body(...), current_user: str = Depends(get_current_user)):
+    import json
+    chat_id = str(body.get("chat_id", ""))
+    chat_title = body.get("chat_title", "New Chat")
+    messages = body.get("messages", [])
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id required")
+    try:
+        messages_json = json.dumps(messages)
+        with engine.begin() as conn:
+            existing = conn.execute(text("SELECT id FROM ChatHistory WHERE user_email = :email AND chat_id = :chat_id"), {"email": current_user, "chat_id": chat_id}).fetchone()
+            if existing:
+                conn.execute(text("UPDATE ChatHistory SET chat_title = :title, messages = :messages, updated_at = GETDATE() WHERE user_email = :email AND chat_id = :chat_id"), {"email": current_user, "chat_id": chat_id, "title": chat_title, "messages": messages_json})
+            else:
+                conn.execute(text("INSERT INTO ChatHistory (user_email, chat_id, chat_title, messages) VALUES (:email, :chat_id, :title, :messages)"), {"email": current_user, "chat_id": chat_id, "title": chat_title, "messages": messages_json})
+        return {"message": "Saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/history/delete")
+async def delete_chat_endpoint(body: dict = Body(...), current_user: str = Depends(get_current_user)):
+    chat_id = str(body.get("chat_id", ""))
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id required")
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM ChatHistory WHERE user_email = :email AND chat_id = :chat_id"), {"email": current_user, "chat_id": chat_id})
+        return {"message": "Deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/history/clear")
+async def clear_all_history(current_user: str = Depends(get_current_user)):
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM ChatHistory WHERE user_email = :email"), {"email": current_user})
+        return {"message": "All chats cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 def get_table_schema(table_name: str, schema: str = "dbo"):
 
@@ -352,7 +660,7 @@ SELECT clause:"""
             "model": "llama3",
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0, "num_predict": 150}
+            "options": {"temperature": 0, "num_predict": 400}
         },
         timeout=120
     )
@@ -548,10 +856,16 @@ def clean_sql_output(raw_sql: str):
     raw_sql = re.sub(r"```sql", "", raw_sql, flags=re.IGNORECASE)
     raw_sql = raw_sql.replace("```", "")
 
+    # Remove common LLM preambles before SELECT
+    raw_sql = re.sub(r"(?i)^(here is|here's|the sql|sql query|query)[^S]*", "", raw_sql.strip())
+
     # Find the FIRST real SELECT keyword and cut everything before it
     select_match = re.search(r"\bSELECT\b", raw_sql, re.IGNORECASE)
     if select_match:
         raw_sql = raw_sql[select_match.start():]
+
+    # Fix "SELECT TOP 100 Here is the SQL query:\n\nSELECT..." — remove text between first SELECT and second SELECT
+    raw_sql = re.sub(r"(SELECT\s+(?:TOP\s+\d+\s+)?)[^\n]*\n+\s*(SELECT\b)", r"\2", raw_sql, flags=re.IGNORECASE)
 
     # Fix double SELECT SELECT
     raw_sql = re.sub(r"SELECT\s+SELECT\b", "SELECT", raw_sql, flags=re.IGNORECASE)
@@ -808,7 +1122,7 @@ Keep it concise.
             "stream": False,
             "options": {
                 "temperature": 0.3,
-                "num_predict": 200
+                "num_predict": 400
             }
         },
         timeout=120
@@ -919,10 +1233,20 @@ def is_db_question(question: str):
         "which tables", "tables in db", "tables in database",
         "tables in this db", "tables in this database",
         "database size", "db size", "size of db", "size of database",
+        "size of the db", "size of the database", "what is the size",
+        "how big is", "how large is",
         "database name", "db name", "what is the db", "what is the database",
         "what db", "tell me about the db", "tell me about the database",
         "database info", "db info", "database overview", "db overview",
-        "what tables are", "show tables", "list tables"
+        "what tables are", "show tables", "list tables",
+        "summary of all", "summarize all", "overview of all",
+        "explain all tables", "tell me about all", "describe all",
+        "what do these tables", "about all tables", "about the tables",
+        "what does each table",
+        "what join", "which join", "possible join", "join functions",
+        "what can i join", "how can i join", "joins possible",
+        "what queries", "what can i ask", "what questions can",
+        "what can this db", "what insights", "what analysis"
     ])
 
 
@@ -962,6 +1286,121 @@ def answer_db_question(question: str):
             f"The **{db_name}** database contains **{table_count} tables**:\n\n"
             f"{table_list}"
         )
+
+    # Summary — explain each table with columns + row count
+    if any(p in q for p in ["summary", "summarize", "overview", "explain", "tell me about", "describe", "what do", "what does", "about"]):
+        lines = [f"## 🗄️ {db_name} Database Summary\n"]
+        lines.append(f"**{table_count} tables** | **{round(db_size, 2)} MB**\n")
+        lines.append("---")
+
+        for table in tables:
+            try:
+                schema = get_table_schema(table)
+                with engine.connect() as conn:
+                    row_count = conn.execute(text(f"SELECT COUNT(*) FROM [{table}]")).scalar()
+                col_names = ", ".join(f"`{col}`" for col, _ in schema[:6])
+                if len(schema) > 6:
+                    col_names += f" +{len(schema)-6} more"
+
+                # Simple rule-based description
+                t_lower = table.lower()
+                if "customer" in t_lower:
+                    desc = "Stores customer personal details like name, email, phone, and address."
+                elif "order_item" in t_lower or "orderitem" in t_lower:
+                    desc = "Links orders to products — tracks which products were in each order with quantity and price."
+                elif "order" in t_lower:
+                    desc = "Records each purchase transaction with date, total amount, and customer reference."
+                elif "product" in t_lower:
+                    desc = "Catalog of all products with name, price, stock, and category."
+                elif "categor" in t_lower:
+                    desc = "Product categories — groups products into logical sections."
+                elif "changelog" in t_lower or "log" in t_lower:
+                    desc = "Tracks system or data changes over time."
+                else:
+                    desc = f"Contains {row_count} records with {len(schema)} columns."
+
+                lines.append(f"\n### 📋 {table}")
+                lines.append(f"{desc}")
+                lines.append(f"- **Rows:** {row_count:,}")
+                lines.append(f"- **Columns ({len(schema)}):** {col_names}")
+            except:
+                lines.append(f"\n### 📋 {table}\n- Could not fetch details.")
+
+        return "\n".join(lines)
+
+    # JOIN possibilities / general DB questions — use LLM
+    if any(p in q for p in [
+        "join", "what can", "what queries", "what questions",
+        "insights", "analysis", "what can i ask", "possible"
+    ]):
+        # Build schema context for LLM
+        schema_lines = []
+        for table in tables:
+            try:
+                schema = get_table_schema(table)
+                cols = ", ".join(f"{col}" for col, _ in schema)
+                with engine.connect() as conn:
+                    row_count = conn.execute(text(f"SELECT COUNT(*) FROM [{table}]")).scalar()
+                schema_lines.append(f"- {table} ({row_count} rows): {cols}")
+            except:
+                schema_lines.append(f"- {table}")
+
+        schema_text = "\n".join(schema_lines)
+
+        if any(p in q for p in ["insight", "analysis", "what can i get", "what can i do", "what can i ask", "what questions"]):
+            prompt = f"""You are a helpful data analyst. A user has a SQL database called '{db_name}' with these tables:
+
+{schema_text}
+
+The user asked: "{question}"
+
+Give a friendly, practical answer in this format:
+1. Briefly explain what kind of data this database contains (1-2 sentences)
+2. List 5-7 specific and interesting questions/insights the user can get, like:
+   - "Which customer has placed the most orders?"
+   - "What is the total revenue per product category?"
+   - "Which products are running low on stock?"
+   - "Show me all orders placed by a specific customer"
+3. Mention 2-3 JOIN combinations that unlock powerful insights
+
+Be specific, practical, and use the actual table and column names."""
+        else:
+            prompt = f"""You are a helpful data analyst. The user has a SQL database called '{db_name}' with these tables:
+
+{schema_text}
+
+User question: "{question}"
+
+Answer helpfully and specifically using the actual table names and columns. List possible JOIN combinations with the actual column names used to join them."""
+
+        try:
+            resp = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "llama3", "prompt": prompt, "stream": False,
+                      "options": {"temperature": 0.3, "num_predict": 400}},
+                timeout=60
+            )
+            answer = resp.json().get("response", "").strip()
+            if answer:
+                return answer
+        except:
+            pass
+
+        # Fallback — rule-based JOIN list
+        lines = [f"## 🔗 Possible JOINs in **{db_name}**\n"]
+        try:
+            all_schemas = {t: get_table_schema(t) for t in tables}
+            for i, t1 in enumerate(tables):
+                for t2 in tables[i+1:]:
+                    fk = find_join_key_via_fk(t1, t2) or find_join_key_via_fk(t2, t1)
+                    if not fk:
+                        common = find_common_keys(all_schemas[t1], all_schemas[t2])
+                        fk = common[0] if common else None
+                    if fk:
+                        lines.append(f"- **{t1}** ⟷ **{t2}** on `{fk[0]}`")
+        except:
+            pass
+        return "\n".join(lines) if len(lines) > 1 else f"Try: `join Orders to Customers`, `join Products to Categories`"
 
     # General DB overview
     return (
@@ -1014,79 +1453,63 @@ def user_wants_chart(question: str):
 
 
 def generate_sql_all_tables(question: str):
-    """
-    When no table is selected, give LLM the full DB schema and let it
-    generate any SQL query — single table, JOIN, subquery, anything.
-    """
+    """Generate SQL using full DB schema — simple and reliable approach."""
     try:
-        # Fetch all tables and their schemas dynamically
         with engine.connect() as conn:
-            all_tables = [
-                row[0] for row in conn.execute(text(
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
-                ))
-            ]
+            all_tables = [row[0] for row in conn.execute(text(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+            ))]
 
-        # Build full schema description
-        schema_text = ""
+        # Build schema
         all_schemas = {}
+        schema_lines = []
         for table in all_tables:
             schema = get_table_schema(table)
             all_schemas[table] = schema
-            cols = ", ".join(f"{col} ({dtype})" for col, dtype in schema)
-            schema_text += f"\nTable [{table}]: {cols}"
+            cols = ", ".join(f"{col}" for col, _ in schema)
+            schema_lines.append(f"[{table}]: {cols}")
+        schema_text = "\n".join(schema_lines)
 
-        # Build FK relationships for prompt
-        fk_info = ""
+        # Build FK info
+        fk_lines = []
         try:
             with engine.connect() as conn:
                 fk_rows = conn.execute(text("""
-                    SELECT
-                        tp.name AS parent_table,
-                        cp.name AS parent_column,
-                        tr.name AS referenced_table,
-                        cr.name AS referenced_column
+                    SELECT tp.name, cp.name, tr.name, cr.name
                     FROM sys.foreign_keys fk
                     INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
                     INNER JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
                     INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
                     INNER JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
                     INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
-                """))
-                fk_lines = [
-                    f"  [{r[0]}].{r[1]} → [{r[2]}].{r[3]}"
-                    for r in fk_rows
-                ]
-                fk_info = "\n".join(fk_lines)
-        except Exception:
-            fk_info = "  (FK info unavailable)"
+                """)).fetchall()
+                for r in fk_rows:
+                    fk_lines.append(f"[{r[0]}].{r[1]} -> [{r[2]}].{r[3]}")
+        except:
+            pass
+        fk_text = "\n".join(fk_lines) if fk_lines else "None"
 
-        # Build alias map for prompt
-        alias_map = {table: f"t{i+1}" for i, table in enumerate(all_tables)}
-        alias_info = "\n".join(f"  {alias} = [{table}]" for table, alias in alias_map.items())
+        prompt = f"""You are a Microsoft SQL Server expert. Write ONE complete SQL SELECT query.
 
-        prompt = f"""You are a Microsoft SQL Server expert. Write ONE complete SQL query.
-
-DATABASE SCHEMA:
+SCHEMA:
 {schema_text}
 
-FOREIGN KEY RELATIONSHIPS (ONLY valid JOIN paths):
-{fk_info}
+FOREIGN KEYS (use for JOINs):
+{fk_text}
 
-TABLE ALIASES (use these EXACTLY, never mix table names and aliases):
-{alias_info}
-
-STRICT RULES:
-- Write ONLY one SELECT statement — no repetition, no loops
-- Use ONLY the FK relationships listed above to JOIN tables
-- ALWAYS use alias.[ColumnName] — NEVER TableName.[Column] or [Table].[Column]
-- Never mix table names and aliases in the same query
-- Use TOP 100 instead of LIMIT (no TOP 1 unless asking for single value)
-- Stop after the final column in SELECT — do NOT repeat columns
-- Return ONLY the SQL. Start with SELECT. Stop immediately after the last line of SQL.
+RULES:
+1. Use actual table names in brackets: FROM [TableName] AS x
+2. Use short aliases: Customers=c, Orders=o, Products=p, Categories=cat, Order_items=oi
+3. Always write complete FROM clause: FROM [TableName] AS alias
+4. JOIN syntax: JOIN [TableName] AS alias ON a.[col] = b.[col]
+5. Use exact column names from SCHEMA above
+6. If COUNT/SUM/AVG used → add GROUP BY all non-aggregated columns
+7. Use TOP 100, never LIMIT
+8. Return ONLY the SQL query, nothing else
 
 Question: {question}
-SQL:"""
+
+SQL (start with SELECT, write complete query):"""
 
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -1094,93 +1517,37 @@ SQL:"""
                 "model": "llama3",
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0, "num_predict": 250, "stop": ["\n\n", "Question:", "--"]}
+                "options": {"temperature": 0, "num_predict": 500, "stop": ["\n\n\n", "Note:", "This query"]}
             },
             timeout=120
         )
 
         raw_sql = response.json().get("response", "").strip()
+        if not raw_sql.upper().startswith("SELECT"):
+            raw_sql = "SELECT " + raw_sql
+        
         sql = clean_sql_output(raw_sql)
-
-        # If LLM gave explanation instead of SQL — retry with stricter prompt
-        if not sql.strip().upper().startswith("SELECT"):
-            print("LLM gave explanation, retrying with strict prompt...")
-            strict_prompt = f"""Write ONLY a Microsoft SQL Server SELECT query. No explanation. No text. Start with SELECT.
-
-Schema:
-{schema_text}
-
-FK Relationships:
-{fk_info}
-
-Question: {question}
-
-SELECT"""
-            retry_response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "llama3",
-                    "prompt": strict_prompt,
-                    "stream": False,
-                    "options": {"temperature": 0, "num_predict": 200, "stop": ["\n\n", "Note:", "This"]}
-                },
-                timeout=120
-            )
-            retry_raw = retry_response.json().get("response", "").strip()
-            # LLM already starts with SELECT since we prefixed it — don't add again
-            if not retry_raw.upper().startswith("SELECT"):
-                retry_raw = "SELECT " + retry_raw
-            sql = clean_sql_output(retry_raw)
         sql = fix_top_position(sql)
-        sql = fix_bracket_dot_notation(sql)
         sql = convert_limit_to_top(sql)
-        sql = sql.rstrip(";")
+        sql = sql.rstrip(";").strip()
         sql = sql.replace("[[", "[").replace("]]", "]")
+        sql = auto_fix_group_by(sql)
 
-        # Fix: replace TableName.[col] or TableName.col with correct alias
-        for table, alias in alias_map.items():
-            # Replace [TableName].[col] → alias.[col]
-            sql = re.sub(rf'\[{re.escape(table)}\]\.', f'{alias}.', sql, flags=re.IGNORECASE)
-            # Replace TableName.[col] → alias.[col]
-            sql = re.sub(rf'\b{re.escape(table)}\.\[', f'{alias}.[', sql, flags=re.IGNORECASE)
-            # Replace TableName.col → alias.col
-            sql = re.sub(rf'\b{re.escape(table)}\.(\w+)', lambda m, a=alias: f'{a}.{m.group(1)}', sql, flags=re.IGNORECASE)
+        print("All-tables SQL:", sql[:200])
 
-        # Fix: truncate SQL if LLM repeated itself
-        from_match = re.search(r'\bFROM\b', sql, re.IGNORECASE)
-        if from_match:
-            after_from = sql[from_match.start():]
-            second_select = re.search(r'\bSELECT\b', after_from[5:], re.IGNORECASE)
-            if second_select:
-                cut_pos = from_match.start() + 5 + second_select.start()
-                sql = sql[:cut_pos].rstrip().rstrip(",")
-
-        # Fix trailing comma before FROM
-        sql = re.sub(r",\s*\n?\s*FROM\b", "\nFROM", sql, flags=re.IGNORECASE)
-
-        print("All-tables SQL:", sql)
-        print("SQL starts with:", repr(sql[:30]))
+        # Validate complete FROM clause
+        if not re.search(r'\bFROM\s+\[', sql, re.IGNORECASE):
+            print("SQL missing proper FROM clause")
+            return {"reply": "❌ Could not generate a valid query. Please select a specific table first or rephrase your question.", "chart": None, "table_data": None}
 
         if not is_safe_sql(sql):
-            print("BLOCKED SQL:", sql[:200])
             return {"error": "Unsafe SQL blocked"}
 
         try:
             df = execute_sql(sql)
         except Exception as e1:
-            print("All-tables SQL error:", repr(e1))
-            # Retry: strip unnecessary JOINs — keep only FROM clause main table
-            sql_retry = re.sub(r'\b(INNER|LEFT|RIGHT|FULL)?\s*JOIN\b.*?(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|$)',
-                               '', sql, flags=re.IGNORECASE | re.DOTALL)
-            sql_retry = sql_retry.strip()
-            print("Retry SQL (no JOIN):", sql_retry)
-            try:
-                df = execute_sql(sql_retry)
-            except Exception as e2:
-                print("Retry also failed:", repr(e2))
-                return {"error": str(e1)}
-
-        print("Rows returned:", len(df))
+            print("SQL error:", repr(e1))
+            return {"reply": f"❌ Query failed: {str(e1)[:200]}", "chart": None, "table_data": None}
 
         if df.empty:
             return {"reply": "No results found.", "chart": None, "table_data": None}
@@ -1193,8 +1560,6 @@ SELECT"""
         intent = detect_intent(question)
         explanation = "" if is_row_query(question) else explain_result(question, df, intent)
         chart_data = auto_detect_chart(df, detect_chart_preference(question)) if user_wants_chart(question) else None
-
-        # Chart suggestion — only if user didn't ask for chart
         chart_suggestion = None
         if not user_wants_chart(question):
             chart_suggestion = suggest_chart(df, question)
@@ -1207,45 +1572,96 @@ SELECT"""
         }
 
     except Exception as e:
-        print("All-tables SQL error:", repr(e))
+        print("All-tables error:", repr(e))
         return {"error": str(e)}
 
 
+def auto_fix_group_by(sql: str) -> str:
+    """
+    Auto-add GROUP BY if SQL has aggregation (COUNT/SUM/AVG/MAX/MIN)
+    but missing GROUP BY clause.
+    """
+    sql_upper = sql.upper()
+
+    # Only fix if aggregation present but GROUP BY missing
+    has_agg = any(f in sql_upper for f in ["COUNT(", "SUM(", "AVG(", "MAX(", "MIN("])
+    has_group_by = "GROUP BY" in sql_upper
+
+    if not has_agg or has_group_by:
+        return sql  # Nothing to fix
+
+    # Extract SELECT clause columns
+    select_match = re.search(r"SELECT\s+(?:TOP\s+\d+\s+)?(.*?)\s+FROM\b", sql, re.IGNORECASE | re.DOTALL)
+    if not select_match:
+        return sql
+
+    select_cols_raw = select_match.group(1)
+
+    # Split by comma but respect parentheses
+    cols = []
+    depth = 0
+    current = ""
+    for ch in select_cols_raw:
+        if ch == "(": depth += 1
+        elif ch == ")": depth -= 1
+        if ch == "," and depth == 0:
+            cols.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        cols.append(current.strip())
+
+    # Keep only non-aggregated columns (no function calls)
+    non_agg_cols = []
+    agg_pattern = re.compile(r"(COUNT|SUM|AVG|MAX|MIN)\s*\(", re.IGNORECASE)
+    for col in cols:
+        if not agg_pattern.search(col):
+            # Remove alias (AS ...) from the column
+            col_clean = re.sub(r"\s+AS\s+\w+$", "", col, flags=re.IGNORECASE).strip()
+            non_agg_cols.append(col_clean)
+
+    if not non_agg_cols:
+        return sql
+
+    group_by_clause = ", ".join(non_agg_cols)
+
+    # Insert GROUP BY before ORDER BY if exists, otherwise append
+    if "ORDER BY" in sql_upper:
+        sql = re.sub(
+            r"(ORDER\s+BY\b)",
+            f"GROUP BY {group_by_clause}\n\\1",
+            sql,
+            count=1,
+            flags=re.IGNORECASE
+        )
+    else:
+        sql = sql.rstrip() + f"\nGROUP BY {group_by_clause}"
+
+    return sql
+
+
 def build_join_chain(relevant_tables: list, table_schemas: dict):
-    """
-    Build a chain of JOINable tables using FK relationships.
-    Returns ordered list of (table, join_key_on_this, prev_table_key) tuples.
-    Example: Customers → Orders → Order_items → Products → Categories
-    """
+    """Build a chain of JOINable tables using FK relationships."""
     if not relevant_tables:
         return []
 
-    # Build adjacency map using FK relationships
     def get_link(t1, t2):
         fk = find_join_key_via_fk(t1, t2)
         if fk:
             return fk
         common = find_common_keys(table_schemas[t1], table_schemas[t2])
-        if common:
-            return common[0]
-        return None
-
-    # Try to build a connected chain starting from each table
-    from itertools import permutations
+        return common[0] if common else None
 
     best_chain = []
-
     for start in relevant_tables:
         chain = [start]
         remaining = [t for t in relevant_tables if t != start]
-
         while remaining:
             found = False
             for t in remaining:
-                # Check if t connects to any table already in chain
                 for existing in chain:
-                    link = get_link(existing, t)
-                    if link:
+                    if get_link(existing, t):
                         chain.append(t)
                         remaining.remove(t)
                         found = True
@@ -1253,32 +1669,25 @@ def build_join_chain(relevant_tables: list, table_schemas: dict):
                 if found:
                     break
             if not found:
-                break  # No more connections possible
-
+                break
         if len(chain) > len(best_chain):
             best_chain = chain
-
     return best_chain
 
 
 def generate_multistep_join_sql(chain: list, table_schemas: dict, question: str):
-    """
-    Generate SQL for a multi-table JOIN chain.
-    chain = [table1, table2, table3, ...]
-    """
+    """Generate SQL for a multi-table JOIN chain."""
     if len(chain) < 2:
         return None
 
-    # Build schema description for prompt
-    schema_parts = []
     alias_map = {}
+    schema_parts = []
     for i, table in enumerate(chain):
         alias = f"t{i+1}"
         alias_map[table] = alias
         cols = ", ".join(col for col, _ in table_schemas[table])
         schema_parts.append(f"[{table}] alias={alias}: {cols}")
 
-    # Build JOIN conditions
     join_conditions = []
     for i in range(len(chain) - 1):
         t1, t2 = chain[i], chain[i+1]
@@ -1297,10 +1706,9 @@ def generate_multistep_join_sql(chain: list, table_schemas: dict, question: str)
     joins_info = "\n".join(join_conditions)
     alias_info = "\n".join(f"  {alias} = [{table}]" for table, alias in alias_map.items())
 
-    prompt = f"""
-You are a Microsoft SQL Server expert. Write a SQL query using multiple JOINs.
+    prompt = f"""You are a Microsoft SQL Server expert. Write a SQL query using multiple JOINs.
 
-TABLE ALIASES (use ONLY these aliases):
+TABLE ALIASES (use ONLY these):
 {alias_info}
 
 TABLE COLUMNS:
@@ -1311,13 +1719,21 @@ FROM [{chain[0]}] AS t1
 {joins_info}
 
 STRICT RULES:
-- Use ONLY the aliases listed above (t1, t2, t3 etc)
-- ALWAYS use alias.[ColumnName] format — e.g. t1.[FirstName], t2.[Order_id]
-- NEVER use table name directly — only aliases
-- NEVER use [Table].[Column] — only alias.[Column]
+- Use ONLY the aliases listed (t1, t2, t3 etc)
+- ALWAYS use alias.[ColumnName] — e.g. t1.[FirstName]
+- NEVER use table names directly — only aliases
 - Use TOP N instead of LIMIT
-- Wrap all column names in square brackets []
+- Wrap all column names in square brackets
+- If using COUNT/SUM/AVG/MAX/MIN — MUST add GROUP BY for all non-aggregated SELECT columns
+- GROUP BY must come before ORDER BY
 - Return ONLY the SQL query starting with SELECT. No explanation.
+
+Example with aggregation:
+SELECT TOP 5 t1.[FirstName], t1.[LastName], COUNT(t2.[Order_id]) AS TotalOrders
+FROM [Customers] AS t1
+JOIN [Orders] AS t2 ON t1.[customer_id] = t2.[Customer_id]
+GROUP BY t1.[FirstName], t1.[LastName]
+ORDER BY TotalOrders DESC
 
 Question: {question}
 SQL:"""
@@ -1332,7 +1748,6 @@ SQL:"""
         },
         timeout=120
     )
-
     return response.json().get("response", "").strip()
 
 
@@ -1350,20 +1765,49 @@ def try_smart_multitable(question: str):
             ]
 
         q = question.lower()
-        q_normalized = q.replace(" ", "_").replace("-", "_")  # normalize spaces
+        q_normalized = q.replace(" ", "_").replace("-", "_")
         table_schemas = {t: get_table_schema(t) for t in all_tables}
 
-        # Find relevant tables by name or column mention in question
+        # Semantic keyword → table mapping (common query terms)
+        semantic_map = {
+            "customer": ["customers", "customer"],
+            "order": ["orders", "order"],
+            "product": ["products", "product"],
+            "category": ["categories", "category"],
+            "item": ["order_items", "orderitems", "items"],
+            "revenue": ["orders", "order_items"],
+            "sales": ["orders", "order_items"],
+            "spent": ["orders"],
+            "purchase": ["orders", "order_items"],
+            "amount": ["orders", "order_items"],
+            "price": ["products"],
+            "stock": ["products"],
+            "quantity": ["order_items"],
+        }
+
+        # Find relevant tables by name, column, or semantic keyword
         relevant_tables = []
         for table, schema in table_schemas.items():
             col_names = [col.lower() for col, _ in schema]
             table_lower = table.lower()
-            table_normalized = table_lower.replace("_", " ")  # order_items → order items
-            if (table_lower in q or
+            table_normalized = table_lower.replace("_", " ")
+
+            # Direct table name match
+            direct_match = (table_lower in q or
                 table_normalized in q or
                 table_lower in q_normalized or
-                any(col in q for col in col_names)):
-                relevant_tables.append(table)
+                any(col in q for col in col_names))
+
+            # Semantic keyword match
+            semantic_match = False
+            for keyword, related_tables in semantic_map.items():
+                if keyword in q and any(rt in table_lower for rt in related_tables):
+                    semantic_match = True
+                    break
+
+            if direct_match or semantic_match:
+                if table not in relevant_tables:
+                    relevant_tables.append(table)
 
         if len(relevant_tables) < 2:
             return None
@@ -1400,6 +1844,7 @@ def try_smart_multitable(question: str):
         sql = convert_limit_to_top(sql)
         sql = sql.rstrip(";")
         sql = sql.replace("[[", "[").replace("]]", "]")
+        sql = auto_fix_group_by(sql)
 
         print(f"Multi-step SQL: {sql}")
 
@@ -1449,6 +1894,94 @@ def try_smart_multitable(question: str):
 
 def detect_chart_preference(question: str):
     q = question.lower()
+    if "pie" in q:
+        return "pie"
+    if "line" in q:
+        return "line"
+    if "bar" in q:
+        return "bar"
+    if "scatter" in q:
+        return "scatter"
+    return None
+
+
+def is_data_query(question: str) -> bool:
+    """Returns True if question is asking for data — needs SQL. False if it's a general/conversational question."""
+    q = question.lower().strip()
+
+    # These are always conversational — never SQL
+    conversational = [
+        "how can i", "how do i", "how would i", "how should i",
+        "what can i", "what should i", "what would i",
+        "why ", "explain ", "tell me about", "what is ", "what are ",
+        "hello", "hi ", "hey ", "thanks", "thank you",
+        "what does", "what do", "how does", "how do",
+        "suggest", "recommend", "help me", "can you",
+        "what is the size", "size of the", "how big", "how large",
+        "what is the db", "about the db", "about the database"
+    ]
+    if any(q.startswith(p) or p in q for p in conversational):
+        return False
+
+    # Clear data query signals
+    data_signals = [
+        "show ", "list ", "get ", "fetch ", "display ", "give me",
+        "how many", "count ", "total ", "sum ", "average ", "avg ",
+        "max ", "min ", "top ", "highest", "lowest",
+        "which customer", "which product", "which order",
+        "who spent", "who ordered", "who has",
+        "chart", "plot", "graph", "join ",
+        "compare ", "per order", "per customer", "per product"
+    ]
+    return any(signal in q for signal in data_signals)
+
+
+def answer_with_llm(question: str, context: str = "") -> str:
+    """Use Llama3 to answer general/conversational questions with DB context."""
+    try:
+        with engine.connect() as conn:
+            db_name = conn.execute(text("SELECT DB_NAME()")).scalar()
+            all_tables = [row[0] for row in conn.execute(text(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+            ))]
+
+        schema_lines = []
+        for table in all_tables:
+            try:
+                schema = get_table_schema(table)
+                cols = ", ".join(col for col, _ in schema)
+                schema_lines.append(f"- {table}: {cols}")
+            except:
+                schema_lines.append(f"- {table}")
+
+        schema_text = "\n".join(schema_lines)
+
+        context_section = f"\nConversation so far:\n{context}\n" if context else ""
+
+        prompt = f"""You are a helpful AI data assistant for a retail database called '{db_name}'.
+
+The database has these tables:
+{schema_text}
+{context_section}
+User question: {question}
+
+Answer in a friendly, helpful and practical way. Be specific — mention actual table names and column names where relevant. If the user seems to want data, suggest what they can ask."""
+
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.4, "num_predict": 400}
+            },
+            timeout=60
+        )
+        answer = resp.json().get("response", "").strip()
+        return answer if answer else "I'm not sure how to answer that. Try asking for specific data like 'show all customers' or 'total revenue per category'."
+    except Exception as e:
+        return "I couldn't process that question. Try asking for specific data like 'show top 5 products by price'."
+    q = question.lower()
 
     if "pie" in q:
         return "pie"
@@ -1467,14 +2000,24 @@ def detect_chart_preference(question: str):
 # -------------------------
 
 @app.post("/join")
-async def join_tables(body: dict = Body(...)):
+async def join_tables(body: dict = Body(...), current_user: str = Depends(get_current_user)):
     try:
         question = body.get("message", "")
+
+        # --- If it's a DB-level/general question, redirect to chat logic ---
+        if is_db_question(question):
+            return {"reply": answer_db_question(question), "chart": None}
+
+        # --- Try multi-table smart JOIN first (3+ tables or natural language) ---
+        multi_result = try_smart_multitable(question)
+        if multi_result:
+            return multi_result
 
         # 1. Detect table names from the question
         join_pair = detect_join_intent(question)
         if not join_pair:
-            return {"error": "Could not detect two table names for JOIN. Try: 'join Orders to Customers'"}
+            # Fallback — send to generate_sql_all_tables instead of error
+            return generate_sql_all_tables(question)
 
         table1_raw, table2_raw = join_pair
 
@@ -1599,8 +2142,10 @@ async def join_tables(body: dict = Body(...)):
 
 
 @app.post("/chart")
-async def generate_chart(body: dict = Body(...)):
+async def generate_chart(body: dict = Body(...), current_user: str = Depends(get_current_user)):
     question = body.get("message")
+    session = get_session(current_user)
+    active_filename = session["active_filename"]
 
     if not question:
         return {"error": "Empty question"}
@@ -1631,12 +2176,97 @@ async def generate_chart(body: dict = Body(...)):
 # ---- chat endpoint ----
 
 @app.post("/chat")
-async def chat(body: dict = Body(...)):
+async def chat(body: dict = Body(...), current_user: str = Depends(get_current_user)):
     try:
         question = body.get("message")
+        history = body.get("history", [])  # last N messages from frontend
+        session = get_session(current_user)
+        active_filename = session["active_filename"]
+        active_dataframe = session["active_dataframe"]
 
         if not question:
             return {"error": "Empty question"}
+
+        # ---- BUILD CONTEXT from history ----
+        context = ""
+        if history:
+            context_lines = []
+            for m in history[-6:]:
+                role = "User" if m.get("sender") == "user" else "Assistant"
+                msg_text = m.get("text", "")
+                if msg_text:
+                    context_lines.append(f"{role}: {msg_text}")
+            context = "\n".join(context_lines)
+
+        # ---- RESOLVE follow-up question using context ----
+        q_lower_rag = question.lower().strip()
+
+        # Check if question has a clear subject (table name or data keyword)
+        with engine.connect() as conn:
+            all_table_names = [row[0].lower() for row in conn.execute(text(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+            ))]
+        data_subjects = all_table_names + [
+            "customer", "order", "product", "category", "item",
+            "revenue", "sales", "amount", "price", "stock"
+        ]
+        has_clear_subject = any(s in q_lower_rag for s in data_subjects)
+
+        pronoun_words = ["their", "those", "these", "them"]
+        action_starters = ["now ", "also ", "add ", "include ", "filter ",
+                          "sort ", "show only", "just show", "only show",
+                          "what about", "how about", "and also"]
+
+        has_pronoun = any(w in q_lower_rag for w in pronoun_words)
+        has_action_start = any(q_lower_rag.startswith(w) for w in action_starters)
+
+        # RAG trigger: has pronoun/action BUT no clear subject in question
+        needs_context = context and (
+            (has_pronoun and not has_clear_subject) or
+            (has_action_start and not has_clear_subject)
+        )
+
+        if needs_context:
+            try:
+                resolve_prompt = f"""Rewrite the latest question as a complete standalone SQL-ready question using the conversation history.
+
+Conversation history:
+{context}
+
+Latest question: {question}
+
+Rules:
+- Use the EXACT table and column context from history
+- Replace pronouns like "their", "these", "them" with the actual subject from history
+- Keep it short and specific — one sentence
+- Example: if history shows "top 5 customers by orders" and question is "now show their email too"
+  → rewrite as: "show top 5 customers by total orders including their email"
+
+Rewritten question (one line only, no explanation):"""
+
+                resp = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={"model": "llama3", "prompt": resolve_prompt, "stream": False,
+                          "options": {"temperature": 0, "num_predict": 60,
+                                      "stop": ["\n", "Note:", "This"]}},
+                    timeout=30
+                )
+                resolved = resp.json().get("response", "").strip()
+                # Reject if LLM returned SQL
+                is_sql = any(resolved.upper().startswith(w) for w in ["SELECT", "WITH", "INSERT", "UPDATE"])
+                has_sql_keywords = "FROM" in resolved.upper() and "SELECT" in resolved.upper()
+                # Reject if LLM added specific names/values (hallucination)
+                has_proper_names = bool(re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', resolved))
+                # Reject if not meaningfully longer
+                not_better = len(resolved) <= len(question) + 5
+
+                if resolved and not is_sql and not has_sql_keywords and not has_proper_names and not not_better:
+                    print(f"RAG resolved: '{question}' → '{resolved}'")
+                    question = resolved
+                else:
+                    print(f"RAG resolve skipped: '{resolved[:80]}'")
+            except:
+                pass
 
         # ---- EARLY SAFETY CHECK — block dangerous keywords immediately ----
         danger_keywords = ["alter", "drop", "delete", "truncate", "insert", "update", "exec", "execute"]
@@ -1662,7 +2292,6 @@ async def chat(body: dict = Body(...)):
                 "schema of", "structure of", "columns in", "fields in",
                 "schema", "structure", "columns", "fields"
             ]):
-                # Find ALL tables mentioned in question
                 with engine.connect() as conn:
                     all_tables = [row[0] for row in conn.execute(text(
                         "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
@@ -1676,17 +2305,22 @@ async def chat(body: dict = Body(...)):
                         schema = get_table_schema(mentioned_table)
                         col_list = "\n".join(f"  - **{col}** ({dtype})" for col, dtype in schema)
                         reply += f"**{mentioned_table}** table has {len(schema)} columns:\n\n{col_list}\n\n---\n\n"
-                    return {
-                        "reply": reply.strip(),
-                        "chart": None
-                    }
+                    return {"reply": reply.strip(), "chart": None}
 
-            # No table selected — try smart multitable across ALL tables
-            multi_table_result = try_smart_multitable(question)
-            if multi_table_result:
-                return multi_table_result
+            # If it's a general/conversational question — answer with LLM directly
+            if not is_data_query(question):
+                return {
+                    "reply": answer_with_llm(question, context=context),
+                    "chart": None,
+                    "table_data": None
+                }
 
-            # Fallback: generate SQL using full DB schema context
+            # Data query — try smart multi-table JOIN first (FK-based, best quality)
+            multi_result = try_smart_multitable(question)
+            if multi_result and not multi_result.get("error"):
+                return multi_result
+
+            # Fallback — generate SQL using full DB schema
             return generate_sql_all_tables(question)
 
         schema = get_table_schema(active_filename)
@@ -1699,6 +2333,14 @@ async def chat(body: dict = Body(...)):
             return {
                 "reply": answer_meta_question(active_filename, schema),
                 "chart": None
+            }
+
+        # ---- General/conversational question — answer with LLM ----
+        if not is_data_query(question):
+            return {
+                "reply": answer_with_llm(question, context=context),
+                "chart": None,
+                "table_data": None
             }
 
         # ---- Smart multi-table detection ----

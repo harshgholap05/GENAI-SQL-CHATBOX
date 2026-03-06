@@ -312,40 +312,59 @@ Frontend badge: **🔗 5-Table JOIN** `Customers → Orders → Order_items → 
 ## ⚠️ Notes & Limitations
 
 - Uploaded datasets stored in memory — backend restart clears them
-- Chat history in browser localStorage — clearing browser cache removes it
-- Designed for single-user local environment
+- Chat history saved in SQL Server — persists across devices and sessions
+- Multi-user supported — each user has isolated sessions and history
 - LLM speed depends on hardware (GPU strongly recommended for Llama3)
 - Result previews capped at 100 rows
+- RAG context limited to last 6 messages — deeper context requires Vector DB
 
 ---
 
 ## 🔮 Feature Status
 
-|                   Feature                  |           Status          |
-|--------------------------------------------|---------------------------|
-| Persistent chat history (localStorage)     |          ✅ Done          |
-| Dark / Light mode toggle                   |          ✅ Done          |
-| 2+ table JOIN with FK detection            |          ✅ Done          |
-| 2+ table JOIN with column name matching    |          ✅ Done          |
-| Multi-step JOIN chain (3–5 tables)         |          ✅ Done          |
-| Auto chart suggestion (zero hallucination) |          ✅ Done          |
-| Close chart → restore table + suggestion   |          ✅ Done          |
-| Full DB mode (no table selected)           |          ✅ Done          |
-| FK + column auto-relationship detection    |          ✅ Done          |
-| SQL correction pipeline (7 steps)          |          ✅ Done          |
-| Unsafe SQL blocking (early + pipeline)     |          ✅ Done          |
-| Meta / DB-level question handling          |          ✅ Done          |
-| Schema questions (multi-table)             |          ✅ Done          |
-| Download charts as PNG (with data labels)  |          ✅ Done          |
-| Export results to CSV / Excel              |          ✅ Done          |
-| Auto-scroll button (↓)                     |          ✅ Done          |
-| Special Keyword Info panel (ℹ)             |          ✅ Done          |
-| Collapsible sidebar (◀ ▶)                  |          ✅ Done          |
-| SQL retry on LLM explanation response      |          ✅ Done          |
-| Authentication system                      |          🔲 Planned      |
-| Multi-user support                         |          🔲 Planned      |
-| RAG-based contextual memory                |          🔲 Planned      |
-|--------------------------------------------|---------------------------|
+|                   Feature                                    |           Status          |
+|--------------------------------------------------------------|---------------------------|
+| Persistent chat history (localStorage)                       |          ✅ Done          |
+| Dark / Light mode toggle                                     |          ✅ Done          |
+| 2+ table JOIN with FK detection                              |          ✅ Done          |
+| 2+ table JOIN with column name matching                      |          ✅ Done          |
+| Multi-step JOIN chain (3–5 tables)                           |          ✅ Done          |
+| Auto chart suggestion (zero hallucination)                   |          ✅ Done          |
+| Close chart → restore table + suggestion                     |          ✅ Done          |
+| Full DB mode (no table selected)                             |          ✅ Done          |
+| FK + column auto-relationship detection                      |          ✅ Done          |
+| SQL correction pipeline (7 steps)                            |          ✅ Done          |
+| Unsafe SQL blocking (early + pipeline)                       |          ✅ Done          |
+| Meta / DB-level question handling                            |          ✅ Done          |
+| Schema questions (multi-table)                               |          ✅ Done          |
+| Download charts as PNG (with data labels)                    |          ✅ Done          |
+| Export results to CSV / Excel                                |          ✅ Done          |
+| Auto-scroll button (↓)                                       |          ✅ Done          |
+| Special Keyword Info panel (ℹ) with RAG keywords             |          ✅ Done          |
+| Collapsible sidebar (◀ ▶)                                    |          ✅ Done          |
+| SQL retry on LLM explanation response                        |          ✅ Done          |
+| Select All Tables (Full DB) button near Load in sidebar      |          ✅ Done          |
+| Authentication system (SQL Server + Local)                   |          ✅ Done          |
+| - User ID, email, password (hashed), created_at, last_login  |          ✅ Done          |
+| - Auth_Provider (local / google)                             |          ✅ Done          |
+| - Auto-detect duplicate email on register                    |          ✅ Done          |
+| - Logout button in sidebar                                   |          ✅ Done          |
+| - Download chat history button in sidebar                    |          ✅ Done          |
+| - Admin panel (list users, reset password, delete user)      |          ✅ Done          |
+| Multi-user support                                           |          ✅ Done          |
+| - Per-user backend sessions (no table conflict)              |          ✅ Done          |
+| - All API calls authenticated with JWT Bearer token          |          ✅ Done          |
+| Chat history saved per email in SQL Server                   |          ✅ Done          |
+| - View chat history in SQL Server ChatHistory table          |          ✅ Done          |
+| - Delete chat from frontend → deletes from SQL Server too    |          ✅ Done          |
+| - Same history accessible from any device (cross-device)     |          ✅ Done          |
+| RAG-based contextual memory                                  |          ✅ Done          |
+| - Last 6 messages used as context for follow-up questions    |          ✅ Done          |
+| - Pronoun/action-word detection (their, these, now, filter)  |          ✅ Done          |
+| - SQL injection & proper-name hallucination guard            |          ✅ Done          |
+| - Semantic keyword → table detection (revenue, spent, sales) |          ✅ Done          |
+| Google Auth + Email Verification                             |          🔲 Planned       |
+|-------------------------------------------------------------|-----------------------------|
 
 ---
 
@@ -356,7 +375,9 @@ Frontend badge: **🔗 5-Table JOIN** `Customers → Orders → Order_items → 
 - **SQLAlchemy + PyODBC** — Database connection and query execution
 - **Pandas** — Data processing and CSV/XLSX handling
 - **Ollama (Llama3)** — Local LLM for SQL generation and explanations
-- **Microsoft SQL Server** — Primary database
+- **Microsoft SQL Server** — Primary database + user/chat storage
+- **JWT (python-jose)** — Token-based authentication
+- **bcrypt (passlib)** — Secure password hashing
 - **React (Vite)** — Frontend framework
 - **Chart.js + react-chartjs-2** — Data visualization
 - **chartjs-plugin-datalabels** — Data labels on charts

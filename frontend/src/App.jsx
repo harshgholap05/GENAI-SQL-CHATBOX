@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import Sidebar from "./components/SIdebar";
+import AuthPage from "./components/AuthPage";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
 
@@ -39,14 +40,30 @@ const CHART_COLORS = [
 
 // ---- Detect JOIN intent on frontend ----
 // Only triggers when user EXPLICITLY says join/combine/merge + two table names
+// Authenticated fetch helper — auto adds Bearer token
+function authFetch(url, options = {}) {
+  const token = localStorage.getItem("token");
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": options.body && typeof options.body === "string"
+        ? "application/json"
+        : (options.headers?.["Content-Type"] || undefined),
+    },
+  });
+}
+
 function isJoinQuery(text) {
-  // Explicit join/combine/merge keyword
-  if (/\b(join|combine|merge)\b/i.test(text)) return true;
-  // Natural language multi-table: "orders, products, order items and categories"
-  // with join-related context words
-  if (/\b(with|and|between|across)\b/i.test(text) &&
-      (text.match(/,/g) || []).length >= 1 &&
-      /\b(join|show|get|display|combine|merge|connect)\b/i.test(text)) return true;
+  const q = text.toLowerCase();
+  // Block informational/meta questions — these go to /chat
+  if (/\b(what|which|how|can|possible|insight|analysis|tell|explain|describe)\b/.test(q) &&
+      !/\b(join\s+\w+\s+(to|with|and)\s+\w+)\b/.test(q)) return false;
+  // Explicit join/combine/merge with table names
+  if (/\b(join|combine|merge)\s+\w/.test(q)) return true;
+  // Comma-separated multi-table with join keyword
+  if (/\bjoin\b/.test(q) && (q.match(/,/g) || []).length >= 1) return true;
   return false;
 }
 
@@ -485,6 +502,7 @@ function InfoTooltip({ darkMode }) {
     { category: "📝 Summary", items: ["summary", "summarize", "overview", "analyze"] },
     { category: "🔗 JOIN", items: ["join X to Y", "combine X and Y", "merge X with Y"] },
     { category: "🗄️ DB Info", items: ["what tables", "schema of", "columns in", "describe", "how many tables", "db size"] },
+    { category: "🧠 Follow-up (RAG)", items: ["their", "these", "those", "them", "now show", "also show", "filter", "sort", "add", "include"] },
     { category: "⛔ Blocked", items: ["alter", "delete", "drop", "insert", "update", "truncate"] },
   ];
 
@@ -575,62 +593,96 @@ function App() {
   const [darkMode, setDarkMode] = useState(() => {
     return localStorage.getItem("darkMode") === "true";
   });
+
+  const [authUser, setAuthUser] = useState(() => {
+    const token = localStorage.getItem("token");
+    const username = localStorage.getItem("username");
+    const email = localStorage.getItem("email");
+    return token ? { token, username, email } : null;
+  });
+
+  const handleLogin = (userData) => {
+    setAuthUser(userData);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    localStorage.removeItem("username");
+    localStorage.removeItem("email");
+    setAuthUser(null);
+  };
+
   const [tableName, setTableName] = useState("");
   const [tables, setTables] = useState([]);
   const [dbInfo, setDbInfo] = useState(null);
 
-  const [chats, setChats] = useState(() => {
-    try {
-      const saved = localStorage.getItem("chatHistory");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        // Reset loading state on reload
-        return parsed.map(c => ({ ...c, loading: false }));
-      }
-    } catch {}
-    const firstChatId = Date.now();
-    return [{ id: firstChatId, title: "New Chat", messages: [], loading: false }];
-  });
+  // Per-user chat history key (localStorage fallback)
+  const chatKey = `chatHistory_${authUser?.email || "guest"}`;
 
-  const [activeChatId, setActiveChatId] = useState(() => {
-    try {
-      const saved = localStorage.getItem("chatHistory");
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        return parsed[0]?.id || Date.now();
-      }
-    } catch {}
-    return Date.now();
-  });
+  const [chats, setChats] = useState([
+    { id: Date.now(), title: "New Chat", messages: [], loading: false }
+  ]);
+
+  const [activeChatId, setActiveChatId] = useState(() => Date.now());
+
   const [input, setInput] = useState("");
   const [uploadStatus, setUploadStatus] = useState("");
   const [collapsed, setCollapsed] = useState(false);
   const activeChat = chats.find(chat => chat.id === activeChatId);
+
+  // Load chat history from server when user logs in
+  useEffect(() => {
+    if (!authUser?.email) return;
+    authFetch("http://localhost:8000/history")
+      .then(res => res.json())
+      .then(data => {
+        if (data.chats && data.chats.length > 0) {
+          setChats(data.chats);
+          setActiveChatId(data.chats[0].id);
+        } else {
+          const newId = Date.now();
+          setChats([{ id: newId, title: "New Chat", messages: [], loading: false }]);
+          setActiveChatId(newId);
+        }
+      })
+      .catch(() => {});
+  }, [authUser?.email]);
+
+  // Save chat to server whenever chats change
+  useEffect(() => {
+    if (!authUser?.email || !chats.length) return;
+    chats.forEach(chat => {
+      if (chat.messages.length === 0) return; // don't save empty chats
+      authFetch("http://localhost:8000/history/save", {
+        method: "POST",
+        body: JSON.stringify({
+          chat_id: String(chat.id),
+          chat_title: chat.title,
+          messages: chat.messages.map(m => ({
+            sender: m.sender,
+            text: m.text || "",
+            table_data: m.table_data || null,
+            chart: m.chart || null,
+          }))
+        })
+      }).catch(() => {});
+    });
+  }, [chats]);
 
   useEffect(() => {
     document.body.classList.toggle("dark", darkMode);
     localStorage.setItem("darkMode", darkMode);
   }, [darkMode]);
 
-  // Save chat history to localStorage whenever chats change
   useEffect(() => {
-    try {
-      // Don't save loading state
-      const toSave = chats.map(c => ({ ...c, loading: false }));
-      localStorage.setItem("chatHistory", JSON.stringify(toSave));
-    } catch {}
-  }, [chats]);
-
-  useEffect(() => {
-    fetch("http://localhost:8000/tables")
+    authFetch("http://localhost:8000/tables")
       .then(res => res.json())
       .then(data => {
         setTables(data.tables);
         setDbInfo(data);
       })
       .catch(err => console.error(err));
-  }, []);
-
+  }, [authUser?.email]);
 
   function createNewChat() {
     const newChat = {
@@ -651,8 +703,9 @@ function App() {
     formData.append("file", file);
 
     try {
-      const res = await fetch("http://localhost:8000/upload", {
+      const res = await authFetch("http://localhost:8000/upload", {
         method: "POST",
+        headers: {},
         body: formData,
       });
 
@@ -676,18 +729,23 @@ function App() {
       return;
     }
 
-    try {
-      const res = await fetch(
-        `http://localhost:8000/load-table/${tableName}`
-      );
-      const data = await res.json();
+    if (tableName === "__all__") {
+      try {
+        await authFetch("http://localhost:8000/clear-table", { method: "POST" });
+        setUploadStatus("✅ Full DB Mode — all tables active. Ask anything!");
+      } catch {
+        setUploadStatus("✅ Full DB Mode active");
+      }
+      return;
+    }
 
+    try {
+      const res = await authFetch(`http://localhost:8000/load-table/${tableName}`);
+      const data = await res.json();
       if (data.error) {
         setUploadStatus(`❌ ${data.error}`);
       } else {
-        setUploadStatus(
-          `✅ Using DB table: ${tableName} (${data.rows} rows)`
-        );
+        setUploadStatus(`✅ Using DB table: ${tableName} (${data.rows} rows)`);
       }
     } catch {
       setUploadStatus("❌ Failed to load DB table");
@@ -700,7 +758,6 @@ function App() {
     const currentInput = input;
     const isJoin = isJoinQuery(currentInput);
 
-    // Add user message
     setChats(prevChats =>
       prevChats.map(chat =>
         chat.id === activeChatId
@@ -734,10 +791,15 @@ function App() {
         ? "http://localhost:8000/join"
         : "http://localhost:8000/chat";
 
-      const res = await fetch(endpoint, {
+      const res = await authFetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: currentInput }),
+        body: JSON.stringify({
+          message: currentInput,
+          history: (activeChat?.messages || []).slice(-6).map(m => ({
+            sender: m.sender,
+            text: m.text || ""
+          }))
+        }),
       });
 
       const data = await res.json();
@@ -842,6 +904,11 @@ function App() {
     scrollToBottom();
   }, [chats, activeChatId]);
 
+  // Auth gate — after all hooks
+  if (!authUser) {
+    return <AuthPage onLogin={handleLogin} darkMode={darkMode} />;
+  }
+
   return (
     <div className="app">
 
@@ -854,7 +921,16 @@ function App() {
         setActiveChatId={setActiveChatId}
         createNewChat={createNewChat}
         dbInfo={dbInfo}
+        authUser={authUser}
+        onLogout={handleLogout}
+        activeChat={activeChat}
         deleteChat={(id) => {
+          // Delete from server
+          authFetch("http://localhost:8000/history/delete", {
+            method: "DELETE",
+            body: JSON.stringify({ chat_id: String(id) })
+          }).catch(() => {});
+          // Update UI
           const remaining = chats.filter(c => c.id !== id);
           if (remaining.length === 0) {
             const newChat = { id: Date.now(), title: "New Chat", messages: [], loading: false };
@@ -866,10 +942,14 @@ function App() {
           }
         }}
         clearHistory={() => {
+          // Clear from server
+          authFetch("http://localhost:8000/history/clear", {
+            method: "DELETE"
+          }).catch(() => {});
+          // Update UI
           const newChat = { id: Date.now(), title: "New Chat", messages: [], loading: false };
           setChats([newChat]);
           setActiveChatId(newChat.id);
-          localStorage.removeItem("chatHistory");
         }}
       />
 
@@ -917,7 +997,6 @@ function App() {
             >
               {darkMode ? "☀️ Light" : "🌙 Dark"}
             </button>
-            <button className="login-btn">Login</button>
           </div>
         </header>
 
@@ -1137,6 +1216,7 @@ function App() {
                 onChange={(e) => setTableName(e.target.value)}
               >
                 <option value="">Select DB Table</option>
+                <option value="__all__">🗄️ All Tables (Full DB Mode)</option>
                 {tables.map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
