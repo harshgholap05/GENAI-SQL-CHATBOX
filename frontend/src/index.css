@@ -7,6 +7,7 @@
 
 body {
   background-color: #f9fafb;
+  overflow-x: hidden;
 }
 
 .app {
@@ -57,6 +58,9 @@ body {
   flex: 1;
   display: flex;
   flex-direction: column;
+  height: 100vh;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -82,6 +86,8 @@ body {
   flex: 1;
   padding: 30px;
   overflow-y: auto;
+  overflow-x: hidden;
+  background: #f9fafb;
 }
 
 .empty {
@@ -90,21 +96,61 @@ body {
   margin-top: 40px;
 }
 
+/* ---- MESSAGE STYLES ---- */
+
 .message {
-  max-width: 70%;
+  max-width: 80%;
+  min-width: 0;
   padding: 12px 16px;
   border-radius: 12px;
   margin-bottom: 12px;
+  word-break: break-word;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 .message.user {
   background: #111827;
   color: white;
   margin-left: auto;
+  max-width: 70%;
 }
 
 .message.bot {
   background: #e5e7eb;
+  max-width: 90%;
+  min-width: 0;
+  overflow: hidden;
+  contain: layout;
+}
+
+/* ---- TABLE inside message — contained scroll ---- */
+.message.bot .table-scroll-wrapper {
+  overflow-x: auto;
+  overflow-y: auto;
+  width: 100%;
+  max-width: 100%;
+  display: block;
+  border-radius: 8px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.message.bot .table-scroll-wrapper::-webkit-scrollbar {
+  height: 8px;
+}
+
+.message.bot .table-scroll-wrapper::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+.message.bot .table-scroll-wrapper::-webkit-scrollbar-thumb {
+  background: #94a3b8;
+  border-radius: 4px;
+}
+
+.message.bot .table-scroll-wrapper::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
 }
 
 .status {
@@ -118,12 +164,11 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 20px;
+  padding: 16px 20px;
   border-top: 1px solid #e5e7eb;
   background: white;
 }
 
-/* Make input take remaining space */
 .input-bar input {
   flex: 1;
   padding: 12px 16px;
@@ -132,11 +177,9 @@ body {
   outline: none;
 }
 
-
 .upload-btn {
   cursor: pointer;
 }
-
 
 /* Data Controls */
 
@@ -197,42 +240,6 @@ body {
   background: #e5e7eb;
 }
 
-
-.app {
-  display: flex;
-  height: 100vh;
-}
-
-/* Main chat area */
-
-.chat-container {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-}
-
-/* Chat window (THIS FIXES DISAPPEARING ISSUE) */
-
-.chat-window {
-  flex: 1;
-  padding: 30px;
-  overflow-y: auto;
-  background: #f9fafb;
-}
-
-/* Input bar stays at bottom */
-
-.input-bar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 16px 20px;
-  border-top: 1px solid #e5e7eb;
-  background: white;
-}
-
-
 /* Chat Send Button */
 
 .chat-send-btn {
@@ -244,7 +251,6 @@ body {
   cursor: pointer;
   border: 1px solid #e5e7eb;
   transition: all 0.2s ease;
-
 }
 
 .chat-send-btn:hover {
@@ -340,11 +346,16 @@ body.dark .model-name {
 
 body.dark .chat-window {
   background: #0f172a;
+  overflow-x: hidden;
 }
 
 body.dark .message.bot {
   background: #1e293b;
   color: #f1f5f9;
+  max-width: 90%;
+  min-width: 0;
+  overflow: hidden;
+  contain: layout;
 }
 
 body.dark .message.user {
@@ -405,4 +416,29 @@ body.dark .status {
 
 body.dark .login-btn {
   background: #1b1b29;
+}
+
+/* ---- Table scrollbar always visible ---- */
+.message.bot div[style*="overflow"] {
+  scrollbar-width: thin;
+  scrollbar-color: #4f46e5 #e2e8f0;
+}
+
+.message.bot div[style*="overflow"]::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.message.bot div[style*="overflow"]::-webkit-scrollbar-track {
+  background: #e2e8f0;
+  border-radius: 4px;
+}
+
+.message.bot div[style*="overflow"]::-webkit-scrollbar-thumb {
+  background: #4f46e5;
+  border-radius: 4px;
+}
+
+body.dark .message.bot div[style*="overflow"]::-webkit-scrollbar-track {
+  background: #334155;
 }

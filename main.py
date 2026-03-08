@@ -1,4 +1,3 @@
-from asyncio import timeout
 from fastapi import FastAPI, UploadFile, File, Body, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +5,11 @@ import requests
 import pyodbc
 import pandas as pd 
 import os
+import smtplib
+import random
+import string
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 import re
@@ -34,6 +38,57 @@ ACCESS_TOKEN_EXPIRE_HOURS = 24
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
+
+# ---- Email Config ----
+EMAIL_USER = os.getenv("EMAIL_USER", "")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+
+# In-memory OTP store: { email: { otp, expires_at, username, password_hash } }
+otp_store = {}
+
+# System/auth tables — always excluded from SQL generation and JOINs
+SYSTEM_TABLES = ["Users", "ChatHistory", "ChangeLog"]
+
+def system_tables_sql():
+    """Returns SQL exclusion clause like: AND TABLE_NAME NOT IN ('Users','ChatHistory')"""
+    placeholders = ",".join([f"'{t}'" for t in SYSTEM_TABLES])
+    return f"AND TABLE_NAME NOT IN ({placeholders})"
+
+def get_data_tables():
+    """Fetch all non-system tables dynamically from DB."""
+    try:
+        placeholders = ",".join([f"'{t}'" for t in SYSTEM_TABLES])
+        query = f"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT IN ({placeholders}) ORDER BY TABLE_NAME"
+        with engine.connect() as conn:
+            return [row[0] for row in conn.execute(text(query))]
+    except:
+        return []
+
+def generate_otp() -> str:
+    return ''.join(random.choices(string.digits, k=6))
+
+def send_otp_email(to_email: str, otp: str, username: str):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Your GenAI SQL Assistant Verification Code"
+    msg["From"] = EMAIL_USER
+    msg["To"] = to_email
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;">
+        <h2 style="color:#4f46e5;margin-bottom:8px;">GenAI SQL Assistant</h2>
+        <p style="color:#475569;">Hi <b>{username}</b>, verify your email to activate your account.</p>
+        <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:20px;text-align:center;margin:20px 0;">
+            <p style="color:#0369a1;font-size:13px;margin:0 0 8px;">Your verification code</p>
+            <div style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#4f46e5;">{otp}</div>
+        </div>
+        <p style="color:#94a3b8;font-size:12px;">This code expires in <b>10 minutes</b>. Do not share it with anyone.</p>
+    </div>
+    """
+    msg.attach(MIMEText(html, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(EMAIL_USER, to_email, msg.as_string())
 
 
 def hash_password(password: str) -> str:
@@ -110,17 +165,20 @@ def root():
 @app.get("/tables")
 def list_tables():
     try:
-        tables_query = """
+        excl = system_tables_sql()
+        tables_query = f"""
         SELECT TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_TYPE = 'BASE TABLE'
+          {excl}
         ORDER BY TABLE_NAME
         """
 
-        count_query = """
+        count_query = f"""
         SELECT COUNT(*)
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_TYPE = 'BASE TABLE'
+          {excl}
         """
 
         size_query = """
@@ -223,8 +281,7 @@ async def register(body: dict = Body(...)):
     hashed = hash_password(password)
 
     try:
-        with engine.begin() as conn:
-            # Check if email already exists
+        with engine.connect() as conn:
             existing = conn.execute(
                 text("SELECT id FROM Users WHERE email = :email"),
                 {"email": email}
@@ -232,13 +289,22 @@ async def register(body: dict = Body(...)):
             if existing:
                 raise HTTPException(status_code=400, detail="Email already registered")
 
-            conn.execute(text("""
-                INSERT INTO Users (username, email, hashed_password, auth_provider, created_at)
-                VALUES (:username, :email, :hashed, 'local', GETDATE())
-            """), {"username": username, "email": email, "hashed": hashed})
+        # Generate OTP and store temporarily
+        otp = generate_otp()
+        otp_store[email] = {
+            "otp": otp,
+            "expires_at": datetime.utcnow() + timedelta(minutes=10),
+            "username": username,
+            "hashed_password": hashed
+        }
 
-        token = create_access_token({"sub": email})
-        return {"token": token, "username": username, "email": email}
+        # Send OTP email
+        try:
+            send_otp_email(email, otp, username)
+        except Exception as mail_err:
+            raise HTTPException(status_code=500, detail=f"Failed to send OTP email: {str(mail_err)}")
+
+        return {"message": "OTP sent to your email", "email": email}
 
     except HTTPException:
         raise
@@ -246,7 +312,187 @@ async def register(body: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/login")
+@app.post("/verify-otp")
+async def verify_otp(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    otp_input = body.get("otp", "").strip()
+
+    if not email or not otp_input:
+        raise HTTPException(status_code=400, detail="Email and OTP required")
+
+    entry = otp_store.get(email)
+    if not entry:
+        raise HTTPException(status_code=400, detail="No OTP found. Please register again.")
+
+    if datetime.utcnow() > entry["expires_at"]:
+        del otp_store[email]
+        raise HTTPException(status_code=400, detail="OTP expired. Please register again.")
+
+    if entry["otp"] != otp_input:
+        raise HTTPException(status_code=400, detail="Invalid OTP. Please try again.")
+
+    # OTP correct — create user in DB
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO Users (username, email, hashed_password, auth_provider, created_at)
+                VALUES (:username, :email, :hashed, 'local', GETDATE())
+            """), {
+                "username": entry["username"],
+                "email": email,
+                "hashed": entry["hashed_password"]
+            })
+
+        del otp_store[email]  # cleanup
+
+        token = create_access_token({"sub": email})
+        return {"token": token, "username": entry["username"], "email": email}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resend-otp")
+async def resend_otp(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    entry = otp_store.get(email)
+
+    if not entry:
+        raise HTTPException(status_code=400, detail="No pending registration. Please register again.")
+
+    # Generate new OTP
+    otp = generate_otp()
+    otp_store[email]["otp"] = otp
+    otp_store[email]["expires_at"] = datetime.utcnow() + timedelta(minutes=10)
+
+    try:
+        send_otp_email(email, otp, entry["username"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to resend OTP: {str(e)}")
+
+    return {"message": "New OTP sent to your email"}
+
+
+# -------------------------
+# FORGOT PASSWORD ENDPOINTS
+# -------------------------
+
+# Separate store for password reset OTPs
+reset_otp_store = {}
+
+@app.post("/forgot-password")
+async def forgot_password(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    try:
+        with engine.connect() as conn:
+            user = conn.execute(
+                text("SELECT id, username FROM Users WHERE email = :email AND auth_provider = 'local'"),
+                {"email": email}
+            ).fetchone()
+
+        if not user:
+            # Don't reveal if email exists — security best practice
+            return {"message": "If this email is registered, you will receive an OTP"}
+
+        otp = generate_otp()
+        reset_otp_store[email] = {
+            "otp": otp,
+            "expires_at": datetime.utcnow() + timedelta(minutes=10),
+            "username": user[1]
+        }
+
+        # Send reset OTP email
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Reset Your GenAI SQL Assistant Password"
+        msg["From"] = EMAIL_USER
+        msg["To"] = email
+
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px;">
+            <h2 style="color:#4f46e5;">GenAI SQL Assistant</h2>
+            <p style="color:#475569;">Hi <b>{user[1]}</b>, you requested a password reset.</p>
+            <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:20px;text-align:center;margin:20px 0;">
+                <p style="color:#c2410c;font-size:13px;margin:0 0 8px;">Your password reset code</p>
+                <div style="font-size:36px;font-weight:bold;letter-spacing:10px;color:#ea580c;">{otp}</div>
+            </div>
+            <p style="color:#94a3b8;font-size:12px;">This code expires in <b>10 minutes</b>. If you didn't request this, ignore this email.</p>
+        </div>
+        """
+        msg.attach(MIMEText(html, "html"))
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(EMAIL_USER, EMAIL_PASS)
+            server.sendmail(EMAIL_USER, email, msg.as_string())
+
+        return {"message": "If this email is registered, you will receive an OTP"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/verify-reset-otp")
+async def verify_reset_otp(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    otp_input = body.get("otp", "").strip()
+
+    if not email or not otp_input:
+        raise HTTPException(status_code=400, detail="Email and OTP required")
+
+    entry = reset_otp_store.get(email)
+    if not entry:
+        raise HTTPException(status_code=400, detail="No reset request found. Please try again.")
+
+    if datetime.utcnow() > entry["expires_at"]:
+        del reset_otp_store[email]
+        raise HTTPException(status_code=400, detail="OTP expired. Please request a new one.")
+
+    if entry["otp"] != otp_input:
+        raise HTTPException(status_code=400, detail="Invalid OTP. Please try again.")
+
+    # OTP correct — mark as verified (don't delete yet, needed for reset)
+    reset_otp_store[email]["verified"] = True
+    return {"message": "OTP verified", "email": email}
+
+
+@app.post("/reset-password")
+async def reset_password(body: dict = Body(...)):
+    email = body.get("email", "").strip().lower()
+    new_password = body.get("new_password", "").strip()
+
+    if not email or not new_password:
+        raise HTTPException(status_code=400, detail="Email and new password required")
+
+    if len(new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    entry = reset_otp_store.get(email)
+    if not entry or not entry.get("verified"):
+        raise HTTPException(status_code=400, detail="Please verify OTP first")
+
+    try:
+        hashed = hash_password(new_password)
+        with engine.begin() as conn:
+            result = conn.execute(
+                text("UPDATE Users SET hashed_password = :hashed WHERE email = :email AND auth_provider = 'local'"),
+                {"hashed": hashed, "email": email}
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+        del reset_otp_store[email]  # cleanup
+        return {"message": "Password reset successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 async def login(body: dict = Body(...)):
     email = body.get("email", "").strip().lower()
     password = body.get("password", "").strip()
@@ -596,25 +842,6 @@ def detect_join_intent(question: str):
             return match.group(1), match.group(2)
 
     return None
-    """
-    Detect if the user wants a JOIN.
-    STRICT: only matches explicit 'join X to Y', 'combine X and Y', 'merge X with Y'
-    Does NOT match analytical queries like 'max price from products with name'
-    """
-    # Must be: keyword + word + connector + word (exact table name pattern)
-    patterns = [
-        r"^join\s+(\w+)\s+(?:to|with)\s+(\w+)",           # join Orders to Customers
-        r"^combine\s+(\w+)\s+(?:and|with)\s+(\w+)",        # combine Orders and Customers
-        r"^merge\s+(\w+)\s+(?:with|and)\s+(\w+)",          # merge Orders with Customers
-    ]
-
-    q = question.strip()
-    for pattern in patterns:
-        match = re.search(pattern, q, re.IGNORECASE)
-        if match:
-            return match.group(1), match.group(2)
-
-    return None
 
 
 def generate_join_sql(table1: str, table2: str, schema1: list, schema2: list,
@@ -693,7 +920,7 @@ def enforce_schema(sql: str, schema: list, table_name: str):
         with engine.connect() as conn:
             all_tables = set(
                 row[0].lower() for row in conn.execute(text(
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
                 ))
             )
             all_db_columns = set(
@@ -825,6 +1052,38 @@ def fix_top_position(sql: str):
 
 
 
+def fix_offset_syntax(sql: str) -> str:
+    """
+    Fix OFFSET without FETCH NEXT — invalid in SQL Server.
+    Also removes TOP if combined with OFFSET (TOP + OFFSET is invalid in SQL Server).
+    Converts: SELECT TOP 1 ... ORDER BY x DESC OFFSET 1 ROW
+    To:        SELECT ... ORDER BY x DESC OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY
+    """
+    if not re.search(r'\bOFFSET\b', sql, re.IGNORECASE):
+        return sql
+
+    # Already has FETCH NEXT — just normalize ROW → ROWS
+    if re.search(r'\bFETCH\s+NEXT\b', sql, re.IGNORECASE):
+        sql = re.sub(r'\bOFFSET\s+(\d+)\s+ROW\b', r'OFFSET \1 ROWS', sql, flags=re.IGNORECASE)
+        return sql
+
+    # Has OFFSET but no FETCH NEXT — fix it
+    offset_match = re.search(r'\bOFFSET\s+(\d+)\s+ROWS?\b', sql, re.IGNORECASE)
+    if offset_match:
+        offset_n = int(offset_match.group(1))
+        # Remove TOP N since it conflicts with OFFSET/FETCH
+        sql = re.sub(r'\bTOP\s+\d+\s+', '', sql, flags=re.IGNORECASE)
+        # Normalize OFFSET line and add FETCH NEXT
+        sql = re.sub(
+            r'\bOFFSET\s+\d+\s+ROWS?\b.*',
+            f'OFFSET {offset_n} ROWS FETCH NEXT 1 ROWS ONLY',
+            sql,
+            flags=re.IGNORECASE
+        )
+
+    return sql
+
+
 def fix_bracket_dot_notation(sql: str):
     """
     Fix incorrect bracket+dot patterns:
@@ -946,7 +1205,7 @@ def auto_detect_chart(df: pd.DataFrame, chart_pref=None):
         return {
             "type": chart_pref,
             "labels": df[category_col].astype(str).tolist(),
-            "values": df[numeric_col].round(2).tolist()
+            "values": pd.to_numeric(df[numeric_col], errors="coerce").round(2).fillna(0).tolist()
         }
 
     unique_count = df[category_col].nunique()
@@ -959,7 +1218,7 @@ def auto_detect_chart(df: pd.DataFrame, chart_pref=None):
     return {
         "type": chart_type,
         "labels": df[category_col].astype(str).tolist(),
-        "values": df[numeric_col].round(2).tolist()
+        "values": pd.to_numeric(df[numeric_col], errors="coerce").round(2).fillna(0).tolist()
     }
 
 def suggest_chart(df: pd.DataFrame, question: str):
@@ -1050,13 +1309,15 @@ If chart is not appropriate respond with:
         if y_col not in numeric_cols:
             return None
 
+        labels = df[x_col].astype(str).tolist()
+        values = pd.to_numeric(df[y_col], errors="coerce").round(2).fillna(0).tolist()
         return {
             "chart_type": chart_type,
             "x_column": x_col,
             "y_column": y_col,
             "reason": result.get("reason", ""),
-            "labels": df[x_col].astype(str).tolist(),
-            "values": df[y_col].round(2).tolist()
+            "labels": labels,
+            "values": values
         }
 
     except Exception as e:
@@ -1130,68 +1391,6 @@ Keep it concise.
 
     return response.json().get("response", "").strip()
 
-    total_rows = len(df)
-    sample_text = df.head(10).to_string(index=False)
-
-    if intent == "list" or intent == "ranking":
-        prompt = f"""
-User question:
-{question}
-
-Result rows:
-{sample_text}
-
-Return ONLY the list in structured format.
-Do not add commentary.
-Do not add explanations.
-Do not add introductory sentences.
-"""
-
-    elif intent == "summary":
-        prompt = f"""
-User question:
-{question}
-
-Total rows: {total_rows}
-
-Result preview:
-{sample_text}
-
-Provide a high-level analytical summary.
-Do not repeat rows.
-Identify patterns, highest and lowest values,
-and relationships between columns.
-Be concise and insightful.
-"""
-
-    else:
-        prompt = f"""
-User question:
-{question}
-
-Result preview:
-{sample_text}
-
-Answer clearly and naturally.
-Base the answer strictly on the result data.
-"""
-
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.6,
-                "num_predict": 250
-            }
-        },
-        timeout=300
-    )
-
-    return response.json().get("response", "").strip()
-
 
 def is_meta_question(question: str):
     """Detect if user is asking ABOUT the loaded table, not querying it."""
@@ -1239,6 +1438,8 @@ def is_db_question(question: str):
         "what db", "tell me about the db", "tell me about the database",
         "database info", "db info", "database overview", "db overview",
         "what tables are", "show tables", "list tables",
+        "show me table", "show me all table", "table name", "all table name",
+        "show table name", "show all table", "tell me table",
         "summary of all", "summarize all", "overview of all",
         "explain all tables", "tell me about all", "describe all",
         "what do these tables", "about all tables", "about the tables",
@@ -1257,12 +1458,12 @@ def answer_db_question(question: str):
     with engine.connect() as conn:
         db_name = conn.execute(text("SELECT DB_NAME()")).scalar()
         table_count = conn.execute(text(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
         )).scalar()
         tables = [
             row[0] for row in conn.execute(text(
                 "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME"
+                "WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + " ORDER BY TABLE_NAME"
             ))
         ]
         db_size = conn.execute(text(
@@ -1452,12 +1653,101 @@ def user_wants_chart(question: str):
     ])
 
 
+def _join_all_tables_sql():
+    """Build a JOIN-all-tables SQL directly from FK relationships — no LLM, no truncation."""
+    try:
+        # Get all data tables
+        with engine.connect() as conn:
+            data_tables = [row[0] for row in conn.execute(text(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql()
+            ))]
+
+            # Get FK relationships
+            fk_rows = conn.execute(text("""
+                SELECT tp.name, cp.name, tr.name, cr.name
+                FROM sys.foreign_keys fk
+                INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+                INNER JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
+                INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+                INNER JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
+                INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+            """)).fetchall()
+
+        # Build alias map
+        alias_map = {}
+        for t in data_tables:
+            words = re.split(r'[_\s]', t.lower())
+            base = "".join(w[0] for w in words if w)
+            alias_map[t] = base
+
+        # Build FK lookup: (child_table, parent_table) -> (child_col, parent_col)
+        fk_lookup = {}
+        for r in fk_rows:
+            child, child_col, parent, parent_col = r[0], r[1], r[2], r[3]
+            if child in data_tables and parent in data_tables:
+                fk_lookup[(child, parent)] = (child_col, parent_col)
+
+        # Find root table (referenced most = likely Customers or Products)
+        ref_count = {t: 0 for t in data_tables}
+        for (child, parent) in fk_lookup:
+            ref_count[parent] = ref_count.get(parent, 0) + 1
+        root = max(ref_count, key=ref_count.get) if ref_count else data_tables[0]
+
+        # BFS to build join order
+        joined = [root]
+        joins = []
+        remaining = [t for t in data_tables if t != root]
+
+        for _ in range(len(remaining)):
+            for t in remaining[:]:
+                for j in joined:
+                    if (t, j) in fk_lookup:
+                        tc, jc = fk_lookup[(t, j)]
+                        joins.append(f"JOIN [{t}] AS {alias_map[t]} ON {alias_map[t]}.[{tc}] = {alias_map[j]}.[{jc}]")
+                        joined.append(t)
+                        remaining.remove(t)
+                        break
+                    elif (j, t) in fk_lookup:
+                        jc, tc = fk_lookup[(j, t)]
+                        joins.append(f"JOIN [{t}] AS {alias_map[t]} ON {alias_map[j]}.[{jc}] = {alias_map[t]}.[{tc}]")
+                        joined.append(t)
+                        remaining.remove(t)
+                        break
+
+        from_clause = f"FROM [{root}] AS {alias_map[root]}"
+        join_clause = "\n".join(joins)
+        sql = "SELECT TOP 100 *\n" + from_clause + "\n" + join_clause
+
+        df = execute_sql(sql)
+        if df is None or df.empty:
+            return {"reply": "No results found.", "chart": None, "table_data": None}
+
+        table_data = {
+            "columns": list(df.columns),
+            "rows": df.head(100).fillna("").values.tolist()
+        }
+        reply = f"Joined all {len(data_tables)} tables: {', '.join(data_tables)}. Showing {len(df)} rows."
+        return {"reply": reply, "sql": sql, "chart": None, "table_data": table_data}
+
+    except Exception as e:
+        print("join_all_tables error:", e)
+        return None
+
+
 def generate_sql_all_tables(question: str):
     """Generate SQL using full DB schema — simple and reliable approach."""
     try:
+        # Special case: join all tables → build SQL directly, no LLM needed
+        q_lower = question.lower().strip()
+        join_all_phrases = ["join all", "all tables", "combine all", "merge all", "full join",
+                            "show everything", "show all data", "full database", "complete data",
+                            "display all", "get everything", "fetch all"]
+        if any(p in q_lower for p in join_all_phrases):
+            return _join_all_tables_sql()
+
         with engine.connect() as conn:
             all_tables = [row[0] for row in conn.execute(text(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
             ))]
 
         # Build schema
@@ -1506,6 +1796,8 @@ RULES:
 6. If COUNT/SUM/AVG used → add GROUP BY all non-aggregated columns
 7. Use TOP 100, never LIMIT
 8. Return ONLY the SQL query, nothing else
+9. ONLY use tables listed in SCHEMA above — do NOT use Users, ChatHistory or any system table not in SCHEMA
+10. If asked to join ALL tables, only join the tables listed in SCHEMA above — nothing else
 
 Question: {question}
 
@@ -1517,7 +1809,7 @@ SQL (start with SELECT, write complete query):"""
                 "model": "llama3",
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0, "num_predict": 500, "stop": ["\n\n\n", "Note:", "This query"]}
+                "options": {"temperature": 0, "num_predict": 800, "stop": ["\n\n\n", "Note:", "This query"]}
             },
             timeout=120
         )
@@ -1528,6 +1820,7 @@ SQL (start with SELECT, write complete query):"""
         
         sql = clean_sql_output(raw_sql)
         sql = fix_top_position(sql)
+        sql = fix_offset_syntax(sql)
         sql = convert_limit_to_top(sql)
         sql = sql.rstrip(";").strip()
         sql = sql.replace("[[", "[").replace("]]", "]")
@@ -1727,6 +2020,8 @@ STRICT RULES:
 - If using COUNT/SUM/AVG/MAX/MIN — MUST add GROUP BY for all non-aggregated SELECT columns
 - GROUP BY must come before ORDER BY
 - Return ONLY the SQL query starting with SELECT. No explanation.
+- NEVER use Users, ChatHistory or any system table not listed in the schema above
+- Data tables are ONLY the ones listed in the schema above — nothing else
 
 Example with aggregation:
 SELECT TOP 5 t1.[FirstName], t1.[LastName], COUNT(t2.[Order_id]) AS TotalOrders
@@ -1744,7 +2039,7 @@ SQL:"""
             "model": "llama3",
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0, "num_predict": 400}
+            "options": {"temperature": 0, "num_predict": 800}
         },
         timeout=120
     )
@@ -1756,11 +2051,20 @@ def try_smart_multitable(question: str):
     Detects if a question needs data from multiple tables.
     Supports 2, 3, 4, or 5 table JOINs automatically.
     """
+    # Special case: join all tables → use direct SQL builder
+    q_lower = question.lower().strip()
+    # Generic join-all phrases (language-based, intentionally kept)
+    join_all_phrases = ["join all", "all tables", "combine all", "merge all", "full join",
+                        "show everything", "show all data", "full database", "complete data",
+                        "display all", "get everything", "fetch all"]
+    if any(p in q_lower for p in join_all_phrases):
+        return _join_all_tables_sql()
+
     try:
         with engine.connect() as conn:
             all_tables = [
                 row[0] for row in conn.execute(text(
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
                 ))
             ]
 
@@ -1768,22 +2072,25 @@ def try_smart_multitable(question: str):
         q_normalized = q.replace(" ", "_").replace("-", "_")
         table_schemas = {t: get_table_schema(t) for t in all_tables}
 
-        # Semantic keyword → table mapping (common query terms)
-        semantic_map = {
-            "customer": ["customers", "customer"],
-            "order": ["orders", "order"],
-            "product": ["products", "product"],
-            "category": ["categories", "category"],
-            "item": ["order_items", "orderitems", "items"],
-            "revenue": ["orders", "order_items"],
-            "sales": ["orders", "order_items"],
-            "spent": ["orders"],
-            "purchase": ["orders", "order_items"],
-            "amount": ["orders", "order_items"],
-            "price": ["products"],
-            "stock": ["products"],
-            "quantity": ["order_items"],
-        }
+        # Dynamic semantic map — built from actual table/column names in DB
+        # No hardcoding — works with any DB schema
+        semantic_map = {}
+        for table, schema in table_schemas.items():
+            t_lower = table.lower().rstrip("s")  # singular form: customers→customer
+            # Table name itself as keyword
+            semantic_map.setdefault(t_lower, [])
+            if table.lower() not in semantic_map[t_lower]:
+                semantic_map[t_lower].append(table.lower())
+            # Each column name as keyword → maps to its table
+            for col, _ in schema:
+                col_lower = col.lower().rstrip("s")  # singular: orders→order
+                semantic_map.setdefault(col_lower, [])
+                if table.lower() not in semantic_map[col_lower]:
+                    semantic_map[col_lower].append(table.lower())
+                # Also add full col name
+                semantic_map.setdefault(col.lower(), [])
+                if table.lower() not in semantic_map[col.lower()]:
+                    semantic_map[col.lower()].append(table.lower())
 
         # Find relevant tables by name, column, or semantic keyword
         relevant_tables = []
@@ -1798,7 +2105,7 @@ def try_smart_multitable(question: str):
                 table_lower in q_normalized or
                 any(col in q for col in col_names))
 
-            # Semantic keyword match
+            # Semantic keyword match — using dynamic map
             semantic_match = False
             for keyword, related_tables in semantic_map.items():
                 if keyword in q and any(rt in table_lower for rt in related_tables):
@@ -1840,6 +2147,7 @@ def try_smart_multitable(question: str):
 
         sql = clean_sql_output(raw_sql)
         sql = fix_top_position(sql)
+        sql = fix_offset_syntax(sql)
         sql = fix_bracket_dot_notation(sql)
         sql = convert_limit_to_top(sql)
         sql = sql.rstrip(";")
@@ -1906,34 +2214,54 @@ def detect_chart_preference(question: str):
 
 
 def is_data_query(question: str) -> bool:
-    """Returns True if question is asking for data — needs SQL. False if it's a general/conversational question."""
+    """
+    Uses LLM to classify if question needs SQL execution or is conversational.
+    Falls back to keyword heuristics if LLM is unavailable.
+    """
     q = question.lower().strip()
 
-    # These are always conversational — never SQL
-    conversational = [
-        "how can i", "how do i", "how would i", "how should i",
-        "what can i", "what should i", "what would i",
-        "why ", "explain ", "tell me about", "what is ", "what are ",
-        "hello", "hi ", "hey ", "thanks", "thank you",
-        "what does", "what do", "how does", "how do",
-        "suggest", "recommend", "help me", "can you",
-        "what is the size", "size of the", "how big", "how large",
-        "what is the db", "about the db", "about the database"
+    # Fast-path: obvious conversational — skip LLM call entirely
+    obvious_conversational = [
+        "hello", "hi ", "hey ", "thanks", "thank you", "bye",
+        "what is your name", "who are you", "how are you"
     ]
-    if any(q.startswith(p) or p in q for p in conversational):
+    if any(q.startswith(p) or p == q for p in obvious_conversational):
         return False
 
-    # Clear data query signals
-    data_signals = [
+    # Fast-path: obvious data signals — skip LLM call entirely
+    obvious_data = [
         "show ", "list ", "get ", "fetch ", "display ", "give me",
-        "how many", "count ", "total ", "sum ", "average ", "avg ",
-        "max ", "min ", "top ", "highest", "lowest",
-        "which customer", "which product", "which order",
-        "who spent", "who ordered", "who has",
-        "chart", "plot", "graph", "join ",
-        "compare ", "per order", "per customer", "per product"
+        "top ", "count ", "sum ", "total ", "average ", "avg ",
+        "chart", "plot", "graph", "join ", "per order", "per customer",
+        "per product", "per category", "now show", "also show",
+        "filter by", "sort by", "order by",
     ]
-    return any(signal in q for signal in data_signals)
+    if any(signal in q for signal in obvious_data):
+        return True
+
+    # LLM classifier for ambiguous questions
+    try:
+        prompt = (
+            f'You are a classifier. Does this question require running a SQL query on a retail database to answer it? '
+            f'Answer ONLY "yes" or "no".\n'
+            f'Question: {question}'
+        )
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": 3, "stop": ["\n", "."]}
+            },
+            timeout=15
+        )
+        answer = resp.json().get("response", "").strip().lower()
+        print(f"is_data_query LLM: '{question[:60]}' → '{answer}'")
+        return answer.startswith("yes")
+    except Exception:
+        # Fallback if LLM unavailable — default to True (run SQL) for unknown questions
+        return True
 
 
 def answer_with_llm(question: str, context: str = "") -> str:
@@ -1942,7 +2270,7 @@ def answer_with_llm(question: str, context: str = "") -> str:
         with engine.connect() as conn:
             db_name = conn.execute(text("SELECT DB_NAME()")).scalar()
             all_tables = [row[0] for row in conn.execute(text(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
             ))]
 
         schema_lines = []
@@ -1981,18 +2309,6 @@ Answer in a friendly, helpful and practical way. Be specific — mention actual 
         return answer if answer else "I'm not sure how to answer that. Try asking for specific data like 'show all customers' or 'total revenue per category'."
     except Exception as e:
         return "I couldn't process that question. Try asking for specific data like 'show top 5 products by price'."
-    q = question.lower()
-
-    if "pie" in q:
-        return "pie"
-    if "line" in q:
-        return "line"
-    if "bar" in q:
-        return "bar"
-    if "scatter" in q:
-        return "scatter"
-
-    return None
 
 
 # -------------------------
@@ -2026,7 +2342,7 @@ async def join_tables(body: dict = Body(...), current_user: str = Depends(get_cu
             existing = [
                 row[0].lower()
                 for row in conn.execute(text(
-                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
                 ))
             ]
 
@@ -2089,6 +2405,7 @@ async def join_tables(body: dict = Body(...), current_user: str = Depends(get_cu
                                      join_key1, join_key2, question)
         sql = clean_sql_output(raw_sql)
         sql = fix_top_position(sql)
+        sql = fix_offset_syntax(sql)
         sql = convert_limit_to_top(sql)
         sql = sql.rstrip(";")
         sql = sql.replace("[[", "[").replace("]]", "]")
@@ -2204,12 +2521,20 @@ async def chat(body: dict = Body(...), current_user: str = Depends(get_current_u
         # Check if question has a clear subject (table name or data keyword)
         with engine.connect() as conn:
             all_table_names = [row[0].lower() for row in conn.execute(text(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
             ))]
-        data_subjects = all_table_names + [
-            "customer", "order", "product", "category", "item",
-            "revenue", "sales", "amount", "price", "stock"
-        ]
+        # Dynamic data_subjects — table names + ALL column names from DB
+        dynamic_subjects = list(all_table_names)
+        for tname in all_table_names:
+            try:
+                schema = get_table_schema(tname)
+                for col, _ in schema:
+                    c = col.lower()
+                    dynamic_subjects.append(c)
+                    dynamic_subjects.append(c.rstrip("s"))  # singular form
+            except:
+                pass
+        data_subjects = list(set(dynamic_subjects))
         has_clear_subject = any(s in q_lower_rag for s in data_subjects)
 
         pronoun_words = ["their", "those", "these", "them"]
@@ -2252,15 +2577,23 @@ Rewritten question (one line only, no explanation):"""
                     timeout=30
                 )
                 resolved = resp.json().get("response", "").strip()
-                # Reject if LLM returned SQL
+                # Take only first line — reject multi-line explanations
+                resolved = resolved.split("\n")[0].strip().strip('"').strip("'")
+
+                # Reject guards
                 is_sql = any(resolved.upper().startswith(w) for w in ["SELECT", "WITH", "INSERT", "UPDATE"])
                 has_sql_keywords = "FROM" in resolved.upper() and "SELECT" in resolved.upper()
-                # Reject if LLM added specific names/values (hallucination)
                 has_proper_names = bool(re.search(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', resolved))
-                # Reject if not meaningfully longer
                 not_better = len(resolved) <= len(question) + 5
+                too_long = len(resolved) > 200
+                has_explanation = any(w in resolved.lower() for w in [
+                    "i can", "i'll", "i will", "to do this", "the query", "this query",
+                    "select c.", "join ", "group by", "order by", "limit ", "sql query"
+                ])
 
-                if resolved and not is_sql and not has_sql_keywords and not has_proper_names and not not_better:
+                if (resolved and not is_sql and not has_sql_keywords and
+                        not has_proper_names and not not_better and
+                        not too_long and not has_explanation):
                     print(f"RAG resolved: '{question}' → '{resolved}'")
                     question = resolved
                 else:
@@ -2294,7 +2627,7 @@ Rewritten question (one line only, no explanation):"""
             ]):
                 with engine.connect() as conn:
                     all_tables = [row[0] for row in conn.execute(text(
-                        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+                        "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql() + ""
                     ))]
                 mentioned_tables = [
                     t for t in all_tables if t.lower() in question.lower()
@@ -2351,6 +2684,7 @@ Rewritten question (one line only, no explanation):"""
         raw_sql = generate_sql(question, active_filename, schema)
         sql = clean_sql_output(raw_sql)
         sql = fix_top_position(sql)
+        sql = fix_offset_syntax(sql)
         sql = fix_missing_from(sql, active_filename)
         sql = convert_limit_to_top(sql)
         sql = enforce_schema(sql, schema, active_filename)
@@ -2364,8 +2698,20 @@ Rewritten question (one line only, no explanation):"""
         sql = sql.replace("[[", "[").replace("]]", "]")
 
         # Fix: if question asks "per X" or "each X", don't limit to TOP 1
-        per_keywords = ["per order", "per customer", "per product", "per category",
-                        "each order", "each customer", "each product", "per month", "per day"]
+        # Dynamic per_keywords — built from actual table names in DB
+        try:
+            with engine.connect() as _conn:
+                _tbls = [r[0].lower() for r in _conn.execute(text(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql()
+                ))]
+            # Generate "per X" and "each X" for each table name and singular form
+            per_keywords = []
+            for t in _tbls:
+                singular = t.rstrip("s")
+                per_keywords += [f"per {t}", f"per {singular}", f"each {t}", f"each {singular}"]
+            per_keywords += ["per month", "per day", "per year", "per week", "per date"]
+        except:
+            per_keywords = ["per month", "per day", "per year"]
         if any(kw in question.lower() for kw in per_keywords):
             sql = re.sub(r"SELECT\s+TOP\s+1\b", "SELECT TOP 100", sql, flags=re.IGNORECASE)
 

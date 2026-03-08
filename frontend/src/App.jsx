@@ -78,10 +78,12 @@ function ResultTable({ tableData }) {
       row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")
     ).join("\n");
     const blob = new Blob([header + "\n" + body], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
+    link.href = url;
     link.download = `export-${Date.now()}.csv`;
     link.click();
+    URL.revokeObjectURL(url);
   };
 
   const exportExcel = () => {
@@ -107,7 +109,7 @@ function ResultTable({ tableData }) {
   };
 
   return (
-    <div>
+    <div style={{ maxWidth: "100%", overflow: "hidden" }}>
       {/* Export buttons */}
       <div style={{ display: "flex", gap: "8px", marginTop: "10px", marginBottom: "4px" }}>
         <button onClick={exportCSV} style={{
@@ -129,21 +131,24 @@ function ResultTable({ tableData }) {
         </span>
       </div>
 
-      <div style={{
+      <div className="table-scroll-wrapper" style={{
         overflowX: "auto",
+        overflowY: "auto",
         borderRadius: "8px",
         border: "1px solid #e2e8f0",
         maxHeight: "320px",
-        overflowY: "auto"
+        width: "100%",
+        display: "block"
       }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+        <table style={{ borderCollapse: "collapse", fontSize: "12px", tableLayout: "auto" }}>
           <thead>
             <tr style={{ background: "#4f46e5", color: "#fff", position: "sticky", top: 0 }}>
               {columns.map((col, i) => (
                 <th key={i} style={{
-                  padding: "8px 12px", textAlign: "left",
-                  fontWeight: 600, whiteSpace: "nowrap"
-                }}>{col}</th>
+                  padding: "8px 10px", textAlign: "left",
+                  fontWeight: 600, whiteSpace: "nowrap",
+                  minWidth: "120px", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis"
+                }} title={col}>{col}</th>
               ))}
             </tr>
           </thead>
@@ -155,8 +160,9 @@ function ResultTable({ tableData }) {
               }}>
                 {row.map((cell, ci) => (
                   <td key={ci} style={{
-                    padding: "7px 12px", whiteSpace: "nowrap", color: "#334155"
-                  }}>{String(cell)}</td>
+                    padding: "7px 10px", whiteSpace: "nowrap", color: "#334155",
+                    minWidth: "120px", maxWidth: "120px", overflow: "hidden", textOverflow: "ellipsis"
+                  }} title={String(cell)}>{String(cell)}</td>
                 ))}
               </tr>
             ))}
@@ -637,8 +643,20 @@ function App() {
       .then(res => res.json())
       .then(data => {
         if (data.chats && data.chats.length > 0) {
-          setChats(data.chats);
-          setActiveChatId(data.chats[0].id);
+          // Normalize messages — handle both table_data and tableData
+          const normalized = data.chats.map(chat => ({
+            ...chat,
+            loading: false,
+            messages: (chat.messages || []).map(m => ({
+              ...m,
+              tableData: m.tableData || m.table_data || null,
+              chartSuggestion: m.chartSuggestion || null,
+              isJoin: m.isJoin || false,
+              joinKey: m.joinKey || null,
+            }))
+          }));
+          setChats(normalized);
+          setActiveChatId(normalized[0].id);
         } else {
           const newId = Date.now();
           setChats([{ id: newId, title: "New Chat", messages: [], loading: false }]);
@@ -661,8 +679,11 @@ function App() {
           messages: chat.messages.map(m => ({
             sender: m.sender,
             text: m.text || "",
-            table_data: m.table_data || null,
+            tableData: m.tableData || m.table_data || null,
             chart: m.chart || null,
+            chartSuggestion: m.chartSuggestion || null,
+            isJoin: m.isJoin || false,
+            joinKey: m.joinKey || null,
           }))
         })
       }).catch(() => {});
