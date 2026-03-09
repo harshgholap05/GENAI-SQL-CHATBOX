@@ -74,6 +74,26 @@ function ResultTable({ tableData }) {
 
   const isNumeric = (val) => !isNaN(parseFloat(val)) && isFinite(val);
 
+  const isDateStr = (val) => {
+    if (typeof val !== "string") return false;
+    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(val) || /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(val);
+  };
+
+  const formatDate = (val) => {
+    try {
+      const d = new Date(val);
+      if (isNaN(d)) return val;
+      return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })
+        + " " + d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
+    } catch { return val; }
+  };
+
+  const formatCell = (val) => {
+    const s = String(val);
+    if (isDateStr(s)) return formatDate(s);
+    return s;
+  };
+
   const exportCSV = () => {
     const header = columns.join(",");
     const body = rows.map(row =>
@@ -127,7 +147,7 @@ function ResultTable({ tableData }) {
               <tr key={ri} className={ri % 2 === 0 ? "row-even" : "row-odd"}>
                 {row.map((cell, ci) => (
                   <td key={ci} className={isNumeric(cell) ? "td-num" : ""} title={String(cell)}>
-                    {String(cell)}
+                    {formatCell(cell)}
                   </td>
                 ))}
               </tr>

@@ -1340,10 +1340,9 @@ User question:
 Result rows:
 {sample_text}
 
-Return ONLY the list in structured format.
-Do not add commentary.
-Do not add explanations.
-Do not add introductory sentences.
+Write 1-2 short sentences summarizing the key insight from this data.
+Do NOT list or repeat the raw rows — they are already shown in a table.
+Just mention the top result, total, or key pattern briefly.
 """
 
     elif intent == "summary":
@@ -1371,10 +1370,11 @@ User question:
 Result preview:
 {sample_text}
 
-Answer clearly and naturally.
-Base the answer strictly on the result data.
-Do not add extra information.
-Keep it concise.
+Write a SHORT 1-3 sentence answer. 
+Do NOT list or repeat any raw data rows or column values from the result.
+The data is already displayed in a table — just give a direct answer or key insight.
+For example: totals, percentages, patterns, highest/lowest values, or a direct answer to the question.
+Be concise. No bullet points. No tables. Just a short natural sentence or two.
 """
 
     response = requests.post(
