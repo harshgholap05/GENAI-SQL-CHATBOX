@@ -19,6 +19,10 @@ from passlib.context import CryptContext
 
 load_dotenv()
 
+# ---- URL Config (override via .env for production) ----
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+CORS_ORIGIN = os.getenv("CORS_ORIGIN", "http://localhost:5173")
+
 DB_SERVER = "HARSHGHOLAP04"
 DB_NAME = "retailDB"
 DB_DRIVER = "ODBC Driver 17 for SQL Server"
@@ -126,7 +130,7 @@ def warm_up_llm():
     try:
         print("Warming up LLM...")
         requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_URL}/api/generate",
             json={
                 "model": "llama3",
                 "prompt": "SELECT 1",
@@ -142,7 +146,7 @@ def warm_up_llm():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[CORS_ORIGIN],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -884,7 +888,7 @@ SELECT TOP 100 t1.[Order_id], t1.[OrderDate], t2.[FirstName], t2.[LastName]
 SELECT clause:"""
 
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        f"{OLLAMA_URL}/api/generate",
         json={
             "model": "llama3",
             "prompt": prompt,
@@ -1015,7 +1019,7 @@ SQL:
 """
 
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        f"{OLLAMA_URL}/api/generate",
         json={
             "model": "llama3",
             "prompt": prompt,
@@ -1272,7 +1276,7 @@ If chart is not appropriate respond with:
 
     try:
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_URL}/api/generate",
             json={
                 "model": "llama3",
                 "prompt": prompt,
@@ -1378,7 +1382,7 @@ Be concise. No bullet points. No tables. Just a short natural sentence or two.
 """
 
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        f"{OLLAMA_URL}/api/generate",
         json={
             "model": "llama3",
             "prompt": prompt,
@@ -1578,7 +1582,7 @@ Answer helpfully and specifically using the actual table names and columns. List
 
         try:
             resp = requests.post(
-                "http://localhost:11434/api/generate",
+                f"{OLLAMA_URL}/api/generate",
                 json={"model": "llama3", "prompt": prompt, "stream": False,
                       "options": {"temperature": 0.3, "num_predict": 400}},
                 timeout=60
@@ -1806,7 +1810,7 @@ Question: {question}
 SQL (start with SELECT, write complete query):"""
 
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_URL}/api/generate",
             json={
                 "model": "llama3",
                 "prompt": prompt,
@@ -2036,7 +2040,7 @@ Question: {question}
 SQL:"""
 
     response = requests.post(
-        "http://localhost:11434/api/generate",
+        f"{OLLAMA_URL}/api/generate",
         json={
             "model": "llama3",
             "prompt": prompt,
@@ -2249,7 +2253,7 @@ def is_data_query(question: str) -> bool:
             f'Question: {question}'
         )
         resp = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_URL}/api/generate",
             json={
                 "model": "llama3",
                 "prompt": prompt,
@@ -2298,7 +2302,7 @@ User question: {question}
 Answer in a friendly, helpful and practical way. Be specific — mention actual table names and column names where relevant. If the user seems to want data, suggest what they can ask."""
 
         resp = requests.post(
-            "http://localhost:11434/api/generate",
+            f"{OLLAMA_URL}/api/generate",
             json={
                 "model": "llama3",
                 "prompt": prompt,
@@ -2572,7 +2576,7 @@ Rules:
 Rewritten question (one line only, no explanation):"""
 
                 resp = requests.post(
-                    "http://localhost:11434/api/generate",
+                    f"{OLLAMA_URL}/api/generate",
                     json={"model": "llama3", "prompt": resolve_prompt, "stream": False,
                           "options": {"temperature": 0, "num_predict": 60,
                                       "stop": ["\n", "Note:", "This"]}},

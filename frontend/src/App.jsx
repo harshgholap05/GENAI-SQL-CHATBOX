@@ -3,6 +3,7 @@ import Sidebar from "./components/SIdebar";
 import AuthPage from "./components/AuthPage";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
+import API_URL from "./config";
 
 import {
   Chart as ChartJS,
@@ -595,7 +596,7 @@ function App() {
     setAuthUser(null);
   };
 
-  const [tableName, setTableName] = useState("");
+  const [tableName, setTableName] = useState("__all__");
   const [tables, setTables] = useState([]);
   const [dbInfo, setDbInfo] = useState(null);
 
@@ -616,7 +617,7 @@ function App() {
   // Load chat history from server when user logs in
   useEffect(() => {
     if (!authUser?.email) return;
-    authFetch("http://localhost:8000/history")
+    authFetch(`${API_URL}/history`)
       .then(res => res.json())
       .then(data => {
         if (data.chats && data.chats.length > 0) {
@@ -648,7 +649,7 @@ function App() {
     if (!authUser?.email || !chats.length) return;
     chats.forEach(chat => {
       if (chat.messages.length === 0) return; // don't save empty chats
-      authFetch("http://localhost:8000/history/save", {
+      authFetch(`${API_URL}/history/save`, {
         method: "POST",
         body: JSON.stringify({
           chat_id: String(chat.id),
@@ -675,11 +676,13 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    authFetch("http://localhost:8000/tables")
+    authFetch(`${API_URL}/tables`)
       .then(res => res.json())
       .then(data => {
         setTables(data.tables);
         setDbInfo(data);
+        // Auto-activate Full DB mode on login
+        authFetch(`${API_URL}/clear-table`, { method: "POST" }).catch(() => {});
       })
       .catch(err => console.error(err));
   }, [authUser?.email]);
@@ -703,7 +706,7 @@ function App() {
     formData.append("file", file);
 
     try {
-      const res = await authFetch("http://localhost:8000/upload", {
+      const res = await authFetch(`${API_URL}/upload`, {
         method: "POST",
         headers: {},
         body: formData,
@@ -731,7 +734,7 @@ function App() {
 
     if (tableName === "__all__") {
       try {
-        await authFetch("http://localhost:8000/clear-table", { method: "POST" });
+        await authFetch(`${API_URL}/clear-table`, { method: "POST" });
         setUploadStatus("✅ Full DB Mode — all tables active. Ask anything!");
       } catch {
         setUploadStatus("✅ Full DB Mode active");
@@ -740,7 +743,7 @@ function App() {
     }
 
     try {
-      const res = await authFetch(`http://localhost:8000/load-table/${tableName}`);
+      const res = await authFetch(`${API_URL}/load-table/${tableName}`);
       const data = await res.json();
       if (data.error) {
         setUploadStatus(`❌ ${data.error}`);
@@ -788,8 +791,8 @@ function App() {
 
     try {
       const endpoint = isJoin
-        ? "http://localhost:8000/join"
-        : "http://localhost:8000/chat";
+        ? `${API_URL}/join`
+        : `${API_URL}/chat`;
 
       const res = await authFetch(endpoint, {
         method: "POST",
@@ -926,7 +929,7 @@ function App() {
         activeChat={activeChat}
         deleteChat={(id) => {
           // Delete from server
-          authFetch("http://localhost:8000/history/delete", {
+          authFetch(`${API_URL}/history/delete`, {
             method: "DELETE",
             body: JSON.stringify({ chat_id: String(id) })
           }).catch(() => {});
@@ -943,7 +946,7 @@ function App() {
         }}
         clearHistory={() => {
           // Clear from server
-          authFetch("http://localhost:8000/history/clear", {
+          authFetch(`${API_URL}/history/clear`, {
             method: "DELETE"
           }).catch(() => {});
           // Update UI
@@ -960,13 +963,6 @@ function App() {
         <header className="topbar">
           <div className="topbar-left">
             <div className="topbar-title">SQL Assistant</div>
-            {dbInfo && (
-              <div className="topbar-badges">
-                <div className="topbar-badge"><span className="badge-label">DB:</span><span className="badge-val">{dbInfo.database || "N/A"}</span></div>
-                <div className="topbar-badge"><span className="badge-label">Tables:</span><span className="badge-val">{dbInfo.total_tables || 0}</span></div>
-                <div className="topbar-badge"><span className="badge-label">Size:</span><span className="badge-val">{dbInfo.size_mb || "N/A"} MB</span></div>
-              </div>
-            )}
           </div>
           <div className="topbar-right">
             {/* Theme Switcher */}
@@ -1222,46 +1218,8 @@ function App() {
         )}
 
         {/* Status */}
-        {uploadStatus && (
-          <div className="status">
-            {uploadStatus}
-          </div>
-        )}
-
         {/* Input Bar */}
         <div className="input-bar">
-
-          {/* Data Controls */}
-          <div className="data-controls">
-
-            <div className="custom-select">
-              <select
-                value={tableName}
-                onChange={(e) => setTableName(e.target.value)}
-              >
-                <option value="">Select DB Table</option>
-                <option value="__all__">🗄️ All Tables (Full DB Mode)</option>
-                {tables.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-
-            <button className="load-btn" onClick={handleLoadTable}>
-              ⚡ Load
-            </button>
-
-            <label className="upload-pill">
-              ↑ Upload
-              <input
-                type="file"
-                accept=".csv,.xlsx"
-                onChange={handleFileUpload}
-                hidden
-              />
-            </label>
-
-          </div>
 
           {/* Chat Input */}
           <input

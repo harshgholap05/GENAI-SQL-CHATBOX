@@ -1,4 +1,5 @@
 import { useState } from "react";
+import API_URL from "../config";
 
 function Chat() {
   const [message, setMessage] = useState("");
@@ -10,7 +11,7 @@ function Chat() {
     setChat(prev => [...prev, { role: "user", text: message }]);
     setMessage("");
 
-    const res = await fetch("http://localhost:8000/chat", {
+    const res = await fetch(`${API_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message })

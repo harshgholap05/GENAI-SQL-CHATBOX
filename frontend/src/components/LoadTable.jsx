@@ -1,10 +1,11 @@
 import { useState } from "react";
+import API_URL from "../config";
 
 function LoadTable({ onLoaded }) {
   const [table, setTable] = useState("");
 
   const loadTable = async () => {
-    const res = await fetch(`http://localhost:8000/load-table/${table}`);
+    const res = await fetch(`${API_URL}/load-table/${table}`);
     const data = await res.json();
 
     if (data.message) {

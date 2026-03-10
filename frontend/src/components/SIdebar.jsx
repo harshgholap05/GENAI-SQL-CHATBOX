@@ -60,16 +60,7 @@ function Sidebar({
         <button onClick={() => setCollapsed(true)} title="Close sidebar" className="collapse-btn">◀</button>
       </div>
 
-      {/* ── Connected DB Card ── */}
-      {dbInfo && (
-        <div className="db-card">
-          <div className="db-card-label">CONNECTED DB</div>
-          <div className="db-card-name">{dbInfo.database || "N/A"}</div>
-          <div className="db-card-meta">
-            {dbInfo.total_tables} tables · {dbInfo.size_mb || "N/A"} MB
-          </div>
-        </div>
-      )}
+
 
       {/* New Chat */}
       <button className="new-chat-btn" onClick={createNewChat}>+ New Chat</button>

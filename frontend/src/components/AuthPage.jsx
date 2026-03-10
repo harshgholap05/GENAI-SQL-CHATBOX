@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import API_URL from "../config";
 
 // ---- Shared components — defined OUTSIDE AuthPage to prevent remount on render ----
 const Card = ({ bg, cardBg, children }) => (
@@ -71,7 +72,7 @@ function AuthPage({ onLogin, darkMode }) {
       ? { email: form.email, password: form.password }
       : { username: form.username, email: form.email, password: form.password };
     try {
-      const res = await fetch(`http://localhost:8000${endpoint}`, {
+      const res = await fetch(`${API_URL}${endpoint}`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
@@ -99,7 +100,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (otpValue.length < 6) { setError("Please enter the complete 6-digit OTP"); return; }
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/verify-otp", {
+      const res = await fetch(`${API_URL}/verify-otp`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail, otp: otpValue }),
       });
@@ -119,7 +120,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (resendTimer > 0) return;
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/resend-otp", {
+      const res = await fetch(`${API_URL}/resend-otp`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail }),
       });
@@ -134,7 +135,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (!pendingEmail.trim()) { setError("Please enter your email"); return; }
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/forgot-password", {
+      const res = await fetch(`${API_URL}/forgot-password`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail }),
       });
@@ -150,7 +151,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (otpValue.length < 6) { setError("Please enter the complete 6-digit OTP"); return; }
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/verify-reset-otp", {
+      const res = await fetch(`${API_URL}/verify-reset-otp`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail, otp: otpValue }),
       });
@@ -165,7 +166,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (resendTimer > 0) return;
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/forgot-password", {
+      const res = await fetch(`${API_URL}/forgot-password`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail }),
       });
@@ -180,7 +181,7 @@ function AuthPage({ onLogin, darkMode }) {
     if (newPassword !== confirmPassword) { setError("Passwords do not match"); return; }
     setError(""); setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/reset-password", {
+      const res = await fetch(`${API_URL}/reset-password`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: pendingEmail, new_password: newPassword }),
       });
