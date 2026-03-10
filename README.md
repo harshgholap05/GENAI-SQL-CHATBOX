@@ -528,7 +528,6 @@ Frontend badge: **🔗 5-Table JOIN** `Customers → Orders → Order_items → 
 | - SQL injection & proper-name hallucination guard            |          ✅ Done          |
 | - Semantic keyword → table detection (revenue, spent, sales) |          ✅ Done          |
 | - Dynamic data_subjects from actual DB schema                |          ✅ Done          |
-| Google OAuth Login                                           |          🔲 Planned       |
 |--------------------------------------------------------------|---------------------------|
 
 ---
