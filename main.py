@@ -16,15 +16,65 @@ import re
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from contextvars import ContextVar
 
 load_dotenv()
 
 # ---- URL Config (override via .env for production) ----
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-CORS_ORIGIN = os.getenv("CORS_ORIGIN", "http://localhost:5173")
+DEFAULT_CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+EXTRA_CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGIN", "").split(",")
+    if origin.strip()
+]
+CORS_ORIGINS = list(dict.fromkeys(DEFAULT_CORS_ORIGINS + EXTRA_CORS_ORIGINS))
+
+# ---- Groq Config ----
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = "llama-3.3-70b-versatile"  # Fast Groq model
+try:
+    from groq import Groq as GroqClient
+    _groq_client = GroqClient(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+except ImportError:
+    _groq_client = None
+
+# Per-request model context variable ('ollama' or 'groq')
+_current_model: ContextVar[str] = ContextVar("current_model", default="ollama")
+
+
+def call_llm(prompt: str, options: dict = None, timeout: int = 60) -> str:
+    """Route LLM call to Ollama or Groq based on current request's model choice."""
+    opts = options or {}
+    model_type = _current_model.get()
+
+    if model_type == "groq" and _groq_client:
+        try:
+            max_tokens = opts.get("num_predict", 400)
+            temperature = opts.get("temperature", 0.5)
+            stop = opts.get("stop", None)
+            response = _groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=float(temperature),
+                stop=stop if stop else None,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"Groq error: {repr(e)} — falling back to Ollama")
+            # Fall through to Ollama
+
+    # Ollama (default)
+    response = requests.post(
+        f"{OLLAMA_URL}/api/generate",
+        json={"model": "llama3", "prompt": prompt, "stream": False, "options": opts},
+        timeout=timeout,
+    )
+    return response.json().get("response", "").strip()
 
 DB_SERVER = "HARSHGHOLAP04"
-DB_NAME = "retailDB"
+DB_NAME = "RetailDB"
 DB_DRIVER = "ODBC Driver 17 for SQL Server"
 
 DATABASE_URL = (
@@ -52,6 +102,13 @@ otp_store = {}
 
 # System/auth tables — always excluded from SQL generation and JOINs
 SYSTEM_TABLES = ["Users", "ChatHistory", "ChangeLog"]
+
+# Queries matching these rules are blocked before any SQL generation/execution.
+RESTRICTED_REPLY = "Restricted: read-only mode is enabled. Data modification requests (add, create, change, update, delete, alter) are not allowed."
+SYSTEM_CONTROL_REPLY = (
+    "I am an AI assistant. I do not have access to system controls "
+    "or sensitive operations like shutdown, reboot, restart, or poweroff."
+)
 
 def system_tables_sql():
     """Returns SQL exclusion clause like: AND TABLE_NAME NOT IN ('Users','ChatHistory')"""
@@ -120,6 +177,18 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     email = decode_token(token)
     if not email:
         raise HTTPException(status_code=401, detail="Invalid token")
+    try:
+        with engine.connect() as conn:
+            user = conn.execute(
+                text("SELECT id FROM Users WHERE email = :email"),
+                {"email": email}
+            ).fetchone()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Authentication check failed")
     return email
 
 
@@ -146,7 +215,8 @@ def warm_up_llm():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CORS_ORIGIN],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -167,7 +237,7 @@ def root():
     return {"status": "backend running"}
 
 @app.get("/tables")
-def list_tables():
+def list_tables(current_user: str = Depends(get_current_user)):
     try:
         excl = system_tables_sql()
         tables_query = f"""
@@ -217,6 +287,8 @@ def list_tables():
 # ---- upload endpoint ----
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Read-only access: write operations are disabled for registered users")
     session = get_session(current_user)
     try:
         if file.filename.endswith(".csv"):
@@ -261,6 +333,8 @@ def load_table(table: str, current_user: str = Depends(get_current_user)):
 
 @app.post("/clear-table")
 def clear_table(current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Read-only access: write operations are disabled for registered users")
     session = get_session(current_user)
     session["active_dataframe"] = None
     session["active_filename"] = None
@@ -678,6 +752,8 @@ async def get_history(current_user: str = Depends(get_current_user)):
 
 @app.post("/history/save")
 async def save_chat(body: dict = Body(...), current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Read-only access: write operations are disabled for registered users")
     import json
     chat_id = str(body.get("chat_id", ""))
     chat_title = body.get("chat_title", "New Chat")
@@ -699,6 +775,8 @@ async def save_chat(body: dict = Body(...), current_user: str = Depends(get_curr
 
 @app.delete("/history/delete")
 async def delete_chat_endpoint(body: dict = Body(...), current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Read-only access: write operations are disabled for registered users")
     chat_id = str(body.get("chat_id", ""))
     if not chat_id:
         raise HTTPException(status_code=400, detail="chat_id required")
@@ -712,6 +790,8 @@ async def delete_chat_endpoint(body: dict = Body(...), current_user: str = Depen
 
 @app.delete("/history/clear")
 async def clear_all_history(current_user: str = Depends(get_current_user)):
+    if current_user != ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Read-only access: write operations are disabled for registered users")
     try:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM ChatHistory WHERE user_email = :email"), {"email": current_user})
@@ -887,18 +967,7 @@ SELECT TOP 100 t1.[Order_id], t1.[OrderDate], t2.[FirstName], t2.[LastName]
 
 SELECT clause:"""
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": 400}
-        },
-        timeout=120
-    )
-
-    select_clause = response.json().get("response", "").strip()
+    select_clause = call_llm(prompt, {"temperature": 0, "num_predict": 400}, 120)
     select_clause = clean_sql_output(select_clause)
 
     # If LLM didn't give SELECT, build default
@@ -1018,21 +1087,7 @@ Respond with ONLY the SQL query. Start your response with SELECT. No preamble, n
 SQL:
 """
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0,
-                "num_predict": 120
-            }
-        },
-        timeout=120
-    )
-
-    return response.json().get("response", "").strip()
+    return call_llm(prompt, {"temperature": 0, "num_predict": 120}, 120)
 
 
 
@@ -1186,6 +1241,70 @@ def is_safe_sql(sql: str):
     return sql_stripped.startswith("SELECT") and not any(f in sql_stripped for f in forbidden)
 
 
+def is_system_control_request(question: str) -> bool:
+    """Detect system-control attempts that the assistant cannot execute."""
+    q = re.sub(r"\s+", " ", (question or "").lower().strip())
+    if not q:
+        return False
+
+    patterns = [
+        r"\bshutdown\b",
+        r"\bpoweroff\b",
+        r"\breboot\b",
+        r"\brestart\b",
+        r"\bturn\s+off\s+(the\s+)?(system|pc|computer|server)\b",
+        r"\bswitch\s+off\s+(the\s+)?(system|pc|computer|server)\b",
+    ]
+    return any(re.search(p, q) for p in patterns)
+
+
+#Restrication From Select and sensitive Information 
+def is_restricted_user_question(question: str) -> bool:
+    """
+    Block direct SQL input and obvious attempts to fetch sensitive full customer data.
+    """
+    q = re.sub(r"\s+", " ", question.lower().strip())
+    if not q:
+        return False
+
+    # Block direct SQL pasted in chat box.
+    if re.match(r"^(select|insert|update|delete|drop|alter|truncate|exec|execute)\b", q):
+        return True
+
+    # Strict read-only mode: block natural-language data/schema modification intent.
+    mutation_patterns = [
+        r"\b(add|create|insert|update|delete|remove|drop|alter|truncate|modify|change|edit|rename|replace|append|overwrite)\b",
+        r"\b(new\s+(record|row|entry|column|field|table))\b",
+        r"\b(make|set)\s+.*\b(column|field|value|table)\b",
+        r"\b(jod|jodo|jodna|badal|badlo|badalna|hatao|hatana)\b",
+    ]
+    if any(re.search(p, q) for p in mutation_patterns):
+        return True
+
+    # Allow normal English sentences starting with "with", but block CTE-style SQL.
+    if q.startswith("with ") and "select" in q and " from " in q:
+        return True
+
+    restricted_patterns = [
+        r"\bselect\s+\*\s+from\s+\[?(customers?|users?|chathistory)\]?\b",
+        r"\b(show|list|get|fetch|display)\s+(all\s+)?customers?\b",
+        r"\bcustomers?\s+(data|details|information|records?)\b",
+        r"\b(all\s+)?customers?\b.*\b(email|phone|address|zipcode)\b",
+    ]
+
+    return any(re.search(pattern, q) for pattern in restricted_patterns)
+
+
+def get_guardrail_reply(question: str):
+    """Return a safety reply string when user prompt should be blocked; else None."""
+    if is_system_control_request(question):
+        return SYSTEM_CONTROL_REPLY
+    if is_restricted_user_question(question):
+        return RESTRICTED_REPLY
+    return None
+
+
+
 def execute_sql(sql: str):
     with engine.connect() as conn:
         return pd.read_sql(sql, conn)
@@ -1275,17 +1394,7 @@ If chart is not appropriate respond with:
 {{"should_suggest": false}}"""
 
     try:
-        response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 100}
-            },
-            timeout=30
-        )
-        raw = response.json().get("response", "").strip()
+        raw = call_llm(prompt, {"temperature": 0, "num_predict": 100}, 30)
 
         # Clean JSON — remove markdown fences if any
         raw = re.sub(r"```json|```", "", raw).strip()
@@ -1381,21 +1490,7 @@ For example: totals, percentages, patterns, highest/lowest values, or a direct a
 Be concise. No bullet points. No tables. Just a short natural sentence or two.
 """
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.3,
-                "num_predict": 400
-            }
-        },
-        timeout=120
-    )
-
-    return response.json().get("response", "").strip()
+    return call_llm(prompt, {"temperature": 0.3, "num_predict": 400}, 120)
 
 
 def is_meta_question(question: str):
@@ -1581,13 +1676,7 @@ User question: "{question}"
 Answer helpfully and specifically using the actual table names and columns. List possible JOIN combinations with the actual column names used to join them."""
 
         try:
-            resp = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0.3, "num_predict": 400}},
-                timeout=60
-            )
-            answer = resp.json().get("response", "").strip()
+            answer = call_llm(prompt, {"temperature": 0.3, "num_predict": 400}, 60)
             if answer:
                 return answer
         except:
@@ -1678,6 +1767,14 @@ def _join_all_tables_sql():
                 INNER JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
                 INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
             """)).fetchall()
+
+        if len(data_tables) < 2:
+            only_table = data_tables[0] if data_tables else "none"
+            return {
+                "reply": f"JOIN is not possible because only one data table is available ({only_table}). Please use read-only queries on that table.",
+                "chart": None,
+                "table_data": None
+            }
 
         # Build alias map
         alias_map = {}
@@ -1809,18 +1906,7 @@ Question: {question}
 
 SQL (start with SELECT, write complete query):"""
 
-        response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 800, "stop": ["\n\n\n", "Note:", "This query"]}
-            },
-            timeout=120
-        )
-
-        raw_sql = response.json().get("response", "").strip()
+        raw_sql = call_llm(prompt, {"temperature": 0, "num_predict": 800, "stop": ["\n\n\n", "Note:", "This query"]}, 120)
         if not raw_sql.upper().startswith("SELECT"):
             raw_sql = "SELECT " + raw_sql
         
@@ -2074,6 +2160,15 @@ def try_smart_multitable(question: str):
                 ))
             ]
 
+        is_join_question = any(w in q_lower for w in ["join", "combine", "merge", "connect", "link"])
+        if is_join_question and len(all_tables) < 2:
+            only_table = all_tables[0] if all_tables else "none"
+            return {
+                "reply": f"JOIN is not possible because only one data table is available ({only_table}).",
+                "chart": None,
+                "table_data": None
+            }
+
         q = question.lower()
         q_normalized = q.replace(" ", "_").replace("-", "_")
         table_schemas = {t: get_table_schema(t) for t in all_tables}
@@ -2252,17 +2347,7 @@ def is_data_query(question: str) -> bool:
             f'Answer ONLY "yes" or "no".\n'
             f'Question: {question}'
         )
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 3, "stop": ["\n", "."]}
-            },
-            timeout=15
-        )
-        answer = resp.json().get("response", "").strip().lower()
+        answer = call_llm(prompt, {"temperature": 0, "num_predict": 3, "stop": ["\n", "."]}, 15).lower()
         print(f"is_data_query LLM: '{question[:60]}' → '{answer}'")
         return answer.startswith("yes")
     except Exception:
@@ -2301,17 +2386,7 @@ User question: {question}
 
 Answer in a friendly, helpful and practical way. Be specific — mention actual table names and column names where relevant. If the user seems to want data, suggest what they can ask."""
 
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.4, "num_predict": 400}
-            },
-            timeout=60
-        )
-        answer = resp.json().get("response", "").strip()
+        answer = call_llm(prompt, {"temperature": 0.4, "num_predict": 400}, 60)
         return answer if answer else "I'm not sure how to answer that. Try asking for specific data like 'show all customers' or 'total revenue per category'."
     except Exception as e:
         return "I couldn't process that question. Try asking for specific data like 'show top 5 products by price'."
@@ -2325,6 +2400,11 @@ Answer in a friendly, helpful and practical way. Be specific — mention actual 
 async def join_tables(body: dict = Body(...), current_user: str = Depends(get_current_user)):
     try:
         question = body.get("message", "")
+        _model_token = _current_model.set(body.get("model", "ollama"))
+
+        guardrail_reply = get_guardrail_reply(question)
+        if guardrail_reply:
+            return {"reply": guardrail_reply, "chart": None, "table_data": None}
 
         # --- If it's a DB-level/general question, redirect to chat logic ---
         if is_db_question(question):
@@ -2334,6 +2414,18 @@ async def join_tables(body: dict = Body(...), current_user: str = Depends(get_cu
         multi_result = try_smart_multitable(question)
         if multi_result:
             return multi_result
+
+        # If DB has only one table, JOIN cannot be performed.
+        with engine.connect() as conn:
+            table_count = conn.execute(text(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' " + system_tables_sql()
+            )).scalar()
+        if (table_count or 0) < 2:
+            return {
+                "reply": "JOIN is not possible because only one data table is available in the database.",
+                "chart": None,
+                "table_data": None
+            }
 
         # 1. Detect table names from the question
         join_pair = detect_join_intent(question)
@@ -2473,6 +2565,10 @@ async def generate_chart(body: dict = Body(...), current_user: str = Depends(get
     if not question:
         return {"error": "Empty question"}
 
+    guardrail_reply = get_guardrail_reply(question)
+    if guardrail_reply:
+        return {"reply": guardrail_reply, "chart": None, "table_data": None}
+
     if not active_filename:
         return {"error": "No table loaded"}
 
@@ -2503,12 +2599,21 @@ async def chat(body: dict = Body(...), current_user: str = Depends(get_current_u
     try:
         question = body.get("message")
         history = body.get("history", [])  # last N messages from frontend
+        _model_token = _current_model.set(body.get("model", "ollama"))
         session = get_session(current_user)
         active_filename = session["active_filename"]
         active_dataframe = session["active_dataframe"]
 
         if not question:
             return {"error": "Empty question"}
+
+        guardrail_reply = get_guardrail_reply(question)
+        if guardrail_reply:
+            return {
+                "reply": guardrail_reply,
+                "chart": None,
+                "table_data": None
+            }
 
         # ---- BUILD CONTEXT from history ----
         context = ""
@@ -2575,14 +2680,7 @@ Rules:
 
 Rewritten question (one line only, no explanation):"""
 
-                resp = requests.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={"model": "llama3", "prompt": resolve_prompt, "stream": False,
-                          "options": {"temperature": 0, "num_predict": 60,
-                                      "stop": ["\n", "Note:", "This"]}},
-                    timeout=30
-                )
-                resolved = resp.json().get("response", "").strip()
+                resolved = call_llm(resolve_prompt, {"temperature": 0, "num_predict": 60, "stop": ["\n", "Note:", "This"]}, 30)
                 # Take only first line — reject multi-line explanations
                 resolved = resolved.split("\n")[0].strip().strip('"').strip("'")
 
@@ -2608,7 +2706,10 @@ Rewritten question (one line only, no explanation):"""
                 pass
 
         # ---- EARLY SAFETY CHECK — block dangerous keywords immediately ----
-        danger_keywords = ["alter", "drop", "delete", "truncate", "insert", "update", "exec", "execute"]
+        danger_keywords = [
+            "alter", "drop", "delete", "truncate", "insert", "update", "exec", "execute",
+            "remove", "add", "create", "modify", "change", "edit", "rename", "replace", "append", "overwrite"
+        ]
         q_lower = question.lower().strip()
         if any(re.search(rf'\b{kw}\b', q_lower) for kw in danger_keywords):
             return {

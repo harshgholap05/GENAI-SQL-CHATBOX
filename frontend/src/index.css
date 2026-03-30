@@ -909,6 +909,54 @@ body::before {
 .theme-btn[data-t="cyber"].active  { border-color: #00ffb3; box-shadow: 0 0 10px rgba(0,255,180,0.6); }
 .theme-btn[data-t="purple"].active { border-color: #7c3aed; box-shadow: 0 0 8px rgba(124,58,237,0.5); }
 
+/* ---- Model Switcher ---- */
+.model-switcher {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface3);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  padding: 4px;
+  transition: all 0.3s;
+}
+
+.model-btn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  background: transparent;
+  color: var(--muted2);
+  transition: all 0.2s;
+}
+
+.model-btn:hover {
+  transform: scale(1.05);
+  color: var(--text);
+}
+
+.model-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(79, 70, 229, 0.45);
+}
+
+[data-theme="cyber"] .model-btn.active {
+  background: #00ffb3;
+  color: #05060a;
+  border-color: #00ffb3;
+  box-shadow: 0 0 10px rgba(0,255,180,0.6);
+}
+
 /* ── Keyword Button ── */
 .keyword-btn {
   background: var(--surface3);

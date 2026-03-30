@@ -3,7 +3,6 @@ import Sidebar from "./components/SIdebar";
 import AuthPage from "./components/AuthPage";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
-import API_URL from "./config";
 
 import {
   Chart as ChartJS,
@@ -573,10 +572,32 @@ function InfoTooltip({ darkMode }) {
 }
 
 function App() {
+  const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem("theme") || "dark";
   });
   const darkMode = theme === "dark" || theme === "cyber";
+
+  // ── Model selection ──
+  const [selectedModel, setSelectedModel] = useState(() => {
+    return localStorage.getItem("selectedModel") || "ollama";
+  });
+  const [modelToast, setModelToast] = useState(null);
+  const [showModelDropdown, setShowModelDropdown] = useState(false);
+
+  // Persist model choice
+  React.useEffect(() => {
+    localStorage.setItem("selectedModel", selectedModel);
+  }, [selectedModel]);
+
+  function switchModel(modelId) {
+    if (modelId === selectedModel) return;
+    setSelectedModel(modelId);
+    const label = modelId === "groq" ? "⚡ Groq Cloud (llama-3.3-70b)" : "🖥️ Ollama Local (llama3)";
+    setModelToast(label);
+    setTimeout(() => setModelToast(null), 2500);
+  }
 
   const [authUser, setAuthUser] = useState(() => {
     const token = localStorage.getItem("token");
@@ -617,7 +638,7 @@ function App() {
   // Load chat history from server when user logs in
   useEffect(() => {
     if (!authUser?.email) return;
-    authFetch(`${API_URL}/history`)
+    authFetch(`${API}/history`)
       .then(res => res.json())
       .then(data => {
         if (data.chats && data.chats.length > 0) {
@@ -649,7 +670,7 @@ function App() {
     if (!authUser?.email || !chats.length) return;
     chats.forEach(chat => {
       if (chat.messages.length === 0) return; // don't save empty chats
-      authFetch(`${API_URL}/history/save`, {
+      authFetch(`${API}/history/save`, {
         method: "POST",
         body: JSON.stringify({
           chat_id: String(chat.id),
@@ -676,13 +697,13 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
-    authFetch(`${API_URL}/tables`)
+    authFetch(`${API}/tables`)
       .then(res => res.json())
       .then(data => {
         setTables(data.tables);
         setDbInfo(data);
         // Auto-activate Full DB mode on login
-        authFetch(`${API_URL}/clear-table`, { method: "POST" }).catch(() => {});
+        authFetch(`${API}/clear-table`, { method: "POST" }).catch(() => {});
       })
       .catch(err => console.error(err));
   }, [authUser?.email]);
@@ -706,7 +727,7 @@ function App() {
     formData.append("file", file);
 
     try {
-      const res = await authFetch(`${API_URL}/upload`, {
+      const res = await authFetch(`${API}/upload`, {
         method: "POST",
         headers: {},
         body: formData,
@@ -734,7 +755,7 @@ function App() {
 
     if (tableName === "__all__") {
       try {
-        await authFetch(`${API_URL}/clear-table`, { method: "POST" });
+        await authFetch(`${API}/clear-table`, { method: "POST" });
         setUploadStatus("✅ Full DB Mode — all tables active. Ask anything!");
       } catch {
         setUploadStatus("✅ Full DB Mode active");
@@ -743,7 +764,7 @@ function App() {
     }
 
     try {
-      const res = await authFetch(`${API_URL}/load-table/${tableName}`);
+      const res = await authFetch(`${API}/load-table/${tableName}`);
       const data = await res.json();
       if (data.error) {
         setUploadStatus(`❌ ${data.error}`);
@@ -791,13 +812,14 @@ function App() {
 
     try {
       const endpoint = isJoin
-        ? `${API_URL}/join`
-        : `${API_URL}/chat`;
+        ? `${API}/join`
+        : `${API}/chat`;
 
       const res = await authFetch(endpoint, {
         method: "POST",
         body: JSON.stringify({
           message: currentInput,
+          model: selectedModel,
           history: (activeChat?.messages || []).slice(-6).map(m => ({
             sender: m.sender,
             text: m.text || ""
@@ -929,7 +951,7 @@ function App() {
         activeChat={activeChat}
         deleteChat={(id) => {
           // Delete from server
-          authFetch(`${API_URL}/history/delete`, {
+          authFetch(`${API}/history/delete`, {
             method: "DELETE",
             body: JSON.stringify({ chat_id: String(id) })
           }).catch(() => {});
@@ -946,7 +968,7 @@ function App() {
         }}
         clearHistory={() => {
           // Clear from server
-          authFetch(`${API_URL}/history/clear`, {
+          authFetch(`${API}/history/clear`, {
             method: "DELETE"
           }).catch(() => {});
           // Update UI
@@ -1219,27 +1241,137 @@ function App() {
 
         {/* Status */}
         {/* Input Bar */}
-        <div className="input-bar">
+        <div className="input-bar" style={{ flexDirection: "column", alignItems: "stretch", gap: "8px" }}>
 
-          {/* Chat Input */}
-          <input
-            type="text"
-            placeholder='Ask a question or try "join Orders to Customers"...'
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-          />
+          {/* Top row: input + send */}
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <input
+              type="text"
+              placeholder='Ask a question or try "join Orders to Customers"...'
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+            />
+            <button
+              className="chat-send-btn"
+              onClick={sendMessage}
+              disabled={activeChat?.loading}
+            >
+              ➤
+            </button>
+          </div>
 
-          {/* Send Button */}
-          <button
-            className="chat-send-btn"
-            onClick={sendMessage}
-            disabled={activeChat?.loading}
-          >
-            ➤
-          </button>
+          {/* Bottom row: Claude.ai style model pill + dropdown */}
+          <div style={{ position: "relative", display: "inline-block", paddingLeft: "4px" }}>
+
+            {/* Pill trigger button */}
+            <button
+              onClick={() => setShowModelDropdown(v => !v)}
+              style={{
+                display: "flex", alignItems: "center", gap: "6px",
+                padding: "5px 14px 5px 10px",
+                borderRadius: "20px",
+                border: "1px solid var(--border2)",
+                background: "transparent",
+                color: "var(--text)",
+                fontSize: "13px", fontWeight: 600,
+                fontFamily: "Syne, sans-serif",
+                cursor: "pointer", transition: "all 0.2s",
+              }}
+            >
+              <span>{selectedModel === "groq" ? "⚡" : "🖥️"}</span>
+              <span>{selectedModel === "groq" ? "Groq" : "Ollama"}</span>
+              <span style={{ fontSize: "10px", color: "var(--muted)", fontWeight: 500 }}>
+                {selectedModel === "groq" ? "Cloud · Fast" : "Local"}
+              </span>
+              <span style={{ fontSize: "10px", color: "var(--muted)", marginLeft: "2px" }}>▾</span>
+            </button>
+
+            {/* Dropdown popup — Claude.ai style */}
+            {showModelDropdown && (
+              <>
+                {/* Backdrop to close */}
+                <div
+                  onClick={() => setShowModelDropdown(false)}
+                  style={{ position: "fixed", inset: 0, zIndex: 998 }}
+                />
+                <div style={{
+                  position: "absolute",
+                  bottom: "calc(100% + 10px)",
+                  left: 0,
+                  zIndex: 999,
+                  background: "var(--surface)",
+                  border: "1px solid var(--border2)",
+                  borderRadius: "16px",
+                  padding: "8px",
+                  minWidth: "260px",
+                  boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+                }}>
+                  <p style={{ fontSize: "11px", color: "var(--muted)", padding: "6px 10px 4px", margin: 0, fontWeight: 600, letterSpacing: "0.05em" }}>
+                    SELECT MODEL
+                  </p>
+
+                  {[
+                    { id: "ollama", icon: "🖥️", label: "Ollama (Local)", sub: "Llama3 · Runs on your PC", free: true },
+                    { id: "groq",   icon: "⚡", label: "Groq Cloud",      sub: "llama-3.3-70b · Ultra fast", free: true },
+                  ].map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => { switchModel(m.id); setShowModelDropdown(false); }}
+                      style={{
+                        width: "100%", display: "flex", alignItems: "center",
+                        gap: "12px", padding: "10px 12px", borderRadius: "10px",
+                        border: "none", background: selectedModel === m.id ? "var(--hover)" : "transparent",
+                        color: "var(--text)", cursor: "pointer", textAlign: "left",
+                        transition: "background 0.15s",
+                      }}
+                    >
+                      <span style={{ fontSize: "20px" }}>{m.icon}</span>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: "13px", fontWeight: 700, fontFamily: "Syne, sans-serif" }}>
+                          {m.label}
+                        </div>
+                        <div style={{ fontSize: "11px", color: "var(--muted)", marginTop: "1px" }}>
+                          {m.sub}
+                        </div>
+                      </div>
+                      {selectedModel === m.id && (
+                        <span style={{ color: "var(--accent)", fontSize: "16px" }}>✓</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
 
         </div>
+
+        {/* Model Switch Toast */}
+        {modelToast && (
+          <div style={{
+            position: "fixed",
+            bottom: "80px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "var(--surface)",
+            border: "1px solid var(--accent)",
+            borderRadius: "12px",
+            padding: "10px 20px",
+            fontSize: "14px",
+            fontWeight: 700,
+            color: "var(--accent)",
+            boxShadow: "0 4px 24px rgba(0,0,0,0.3)",
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            animation: "fadeUp 0.3s ease",
+            whiteSpace: "nowrap",
+          }}>
+            ✅ Switched to {modelToast}
+          </div>
+        )}
 
       </main>
 
