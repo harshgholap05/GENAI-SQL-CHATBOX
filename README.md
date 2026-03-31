@@ -55,8 +55,9 @@ Unlike static demos with hardcoded data, this system dynamically adapts to any u
 - `last_login` updated in SQL Server on every successful login
 
 ---
-![WhatsApp Image 2026-03-31 at 3 07 26 PM](https://github.com/user-attachments/assets/3413a971-990b-4e84-84f2-76e881953b3d)
-
+> ```
+> ![WhatsApp Image 2026-03-31 at 3 07 26 PM](https://github.com/user-attachments/assets/3413a971-990b-4e84-84f2-76e881953b3d)
+> ```
 ---
 
 **Forgot Password Flow (OTP-based)**
