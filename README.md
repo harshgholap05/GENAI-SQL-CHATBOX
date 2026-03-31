@@ -289,7 +289,7 @@ Every generated SQL passes through these steps in order:
 
 ## Choose Model 
 
-![WhatsApp Image 2026-03-31 at 3 02 19 PM](https://github.com/user-attachments/assets/e2ea6828-bb74-4bc6-9e2f-d8245d9e6b46)
+<img width="311" height="217" alt="image" src="https://github.com/user-attachments/assets/ba7e7512-8a02-445a-8812-5e5f6146e2a2" />
 
 ---
 ## 🏗️ Tech Stack
