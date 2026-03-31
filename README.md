@@ -32,10 +32,10 @@ Unlike static demos with hardcoded data, this system dynamically adapts to any u
 - Duplicate email detection happens before OTP is sent
 - OTP expires in **10 minutes** — resend generates a fresh OTP
 
----
+--
   <img width="449" height="471" alt="image" src="https://github.com/user-attachments/assets/12f7f953-1901-443c-939d-8204bf8a7398" />
   
----
+--
 > ✅ Email received looks like:
 > ```
 > Subject: Your GenAI SQL Assistant Verification Code
