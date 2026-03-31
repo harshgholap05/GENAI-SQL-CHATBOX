@@ -48,6 +48,9 @@ Unlike static demos with hardcoded data, this system dynamically adapts to any u
 - Email + password login with JWT Bearer token
 - Token stored in `localStorage` — persists across reloads
 - `last_login` updated in SQL Server on every successful login
+- 
+![WhatsApp Image 2026-03-31 at 2 50 15 PM](https://github.com/user-attachments/assets/31e9bc0d-8d76-47bd-acb0-a5d08e91cbc3)
+
 
 **Forgot Password Flow (OTP-based)**
 - "Forgot password?" link on login page — pre-fills email if already typed
