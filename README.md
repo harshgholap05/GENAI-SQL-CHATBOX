@@ -55,9 +55,7 @@ Unlike static demos with hardcoded data, this system dynamically adapts to any u
 - `last_login` updated in SQL Server on every successful login
 
 ---
-  ![WhatsApp Image 2026-03-31 at 2 50 15 PM](https://github.com/user-attachments/assets/798da3e3-0902-4cba-b8e2-0a84e4c42890) 
-  
-![WhatsApp Image 2026-03-31 at 2 50 27 PM](https://github.com/user-attachments/assets/f2f15134-f0ae-49c1-9314-bf6d41cb1e77)
+![WhatsApp Image 2026-03-31 at 3 07 26 PM](https://github.com/user-attachments/assets/3413a971-990b-4e84-84f2-76e881953b3d)
 
 ---
 
@@ -225,10 +223,39 @@ Every generated SQL passes through these steps in order:
 - Adapts to light/dark mode automatically
 - ✕ close button inside panel
 
-### 🌙 Dark Mode
-- One-click dark/light toggle in topbar (🌙 Dark / ☀️ Light)
+---
+  <img width="381" height="809" alt="image" src="https://github.com/user-attachments/assets/5c5324c5-066d-47f5-a707-ecbc964164d4" />
+  
+---
+
+### Multiple Mode (Dark, Light, Cyber, Purple)
+- One-click dark/light/Cyber/Purple) toggle in topbar (🌙 Dark / ☀️ Light/ ⚡ Cyber/ 🌸 Purple)
 - Preference saved in `localStorage` — persists across reloads
 - Full UI coverage: sidebar, chat window, messages, input bar, buttons, badges, tables
+
+## 🌙 Dark Mode Theme View
+
+![WhatsApp Image 2026-03-31 at 3 00 43 PM](https://github.com/user-attachments/assets/6b456377-dfcb-4bbf-a304-bfae9bc543e6)
+
+---
+
+## ☀️ Light Mode Theme View
+
+![WhatsApp Image 2026-03-31 at 3 00 57 PM](https://github.com/user-attachments/assets/b7d5971b-c999-4f23-9830-b6f2a65d6f4a)
+
+---
+
+## ⚡ Cyber Mode Theme View
+
+![WhatsApp Image 2026-03-31 at 3 01 16 PM](https://github.com/user-attachments/assets/7b4c2923-53df-42c0-87b3-95cfcfa59b4f)
+
+---
+
+## ⚡ Purple Mode Theme View
+
+![WhatsApp Image 2026-03-31 at 3 01 31 PM](https://github.com/user-attachments/assets/6e80b3d9-5a3e-41e2-b3e6-b49999fdc055)
+
+---
 
 ### 📱 Persistent Chat History
 - All chats auto-saved to **SQL Server** (`ChatHistory` table) on every message
@@ -259,6 +286,11 @@ Every generated SQL passes through these steps in order:
 
 ---
 
+## Choose Model 
+
+![WhatsApp Image 2026-03-31 at 3 02 19 PM](https://github.com/user-attachments/assets/e2ea6828-bb74-4bc6-9e2f-d8245d9e6b46)
+
+---
 ## 🏗️ Tech Stack
 
 ### Frontend
