@@ -611,4 +611,4 @@ This project demonstrates how a local LLM can be combined with:
 - Full authentication system with email OTP verification and password reset
 
 **This is not just a chatbot.**  
-It is a dynamic AI-powered data exploration engine that understands your database structure automatically — no configuration, no hardcoding.
+It is a dynamic AI-powered data exploration engine that understands your database structure automatically.
